@@ -6,3 +6,5 @@
 __pycache__/
 *.pyc
 images/*.png
+pdf_output/
+*_extracted.txt

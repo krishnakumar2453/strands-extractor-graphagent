@@ -1,4 +1,4 @@
-# Tamil vocabulary extraction pipeline — 7-agent graph
+# Tamil vocabulary extraction pipeline — 5-agent graph
 # Input: OCR text (no OCR agent; text provided directly)
 from strands.multiagent import GraphBuilder
 from strands import Agent
@@ -17,30 +17,10 @@ model = GeminiModel(
     },
 )
 
-# --- (1) Orchestrator ---
-ORCHESTRATOR_PROMPT = """You are the Orchestrator for a Tamil vocabulary extraction pipeline.
-
-INPUT: You receive raw OCR text from a Tamil textbook (page or excerpt). This is the OCR TEXT FOR REFERENCE for the rest of the pipeline.
-
-RESPONSIBILITIES:
-- Assign or confirm a page_id (e.g. "page_1" or from context).
-- Pass the raw_text unchanged. Do not correct, guess, or delete any text.
-
-RULES:
-- Do NOT modify the OCR text. Do NOT remove or add words.
-- Output only the structured message for the next agent.
-
-OUTPUT (respond with this exact JSON structure only, no other text):
-{
-  "page_id": "string (e.g. page_1)",
-  "raw_text": "the full OCR Tamil text exactly as received"
-}
-"""
-
-# --- (2) Word Candidate Agent (Extractor Phase 1: Identify ALL candidates) ---
+# --- (1) Word Candidate Agent (Extractor Phase 1: Identify ALL candidates) ---
 WORD_CANDIDATE_PROMPT = """You are a Tamil language expert. Your job is to identify ALL Tamil word candidates from the OCR text (Phase 1 only: extraction, no discard or root reduction).
 
-INPUT: You receive page_id and raw_text (Tamil OCR from a textbook page). Image may be referenced for verification only.
+INPUT: You receive the raw OCR text (the full Tamil textbook excerpt as a single string). Include that exact raw text in your output as "raw_text" so the next agent can use it.
 
 READING METHOD:
 - Read line by line, word by word. Do NOT skip any section.
@@ -57,6 +37,35 @@ TYPE 2 - ALL OTHER SECTIONS:
 - Do NOT guess or complete incomplete words.
 
 Output a flat list of every Tamil word candidate you see. Recall over precision: if in doubt, include the token.
+
+OUTPUT (this exact JSON structure only):
+{
+  "candidates": ["விவசாயத்தில்", "உழவுத்தொழில்", "மக்கள்", "..."],
+  "raw_text": "the full OCR Tamil text exactly as received"
+}
+"""
+
+# --- (2) Word Candidate Validator Agent (TASK 1 only: find missing words) ---
+WORD_CANDIDATE_VALIDATOR_PROMPT = """You are reviewing the Word Candidate agent output. Your ONLY task is to find ANY missing valid Tamil words from the OCR that were not extracted in the candidates list.
+
+INPUT: You receive (1) "raw_text" and (2) "candidates" from the Word Candidate agent output.
+
+TASK - FIND MISSING WORDS (HIGH PRIORITY):
+1. Compare the OCR text against the extracted candidates and find ANY missing valid Tamil words.
+2. Output a single merged list: original candidates plus any valid missing words, with no duplicates.
+
+YOU MUST NOT INCLUDE AS MISSING WORDS:
+- Single characters (e.g. அ, ஆ, க, ங, ள, ளை, ழ, ற).
+- Incomplete words with blanks or dashes (e.g. த__காளி, சன்_ல்).
+- People names (e.g. விஜய், கார்த்திக், மின்னி, தூரன்).
+- Place names (e.g. சென்னை, தமிழ்நாடு).
+- Numbers (e.g. 12.3, 1, 2).
+- English text.
+- Punctuation or symbols.
+- Labels inside fill-up boxes, tables, or activity frames (e.g. வட்டமிடு, சொல் உறுவாக்குவோம் when used as box instructions).
+- Any token that is not a valid, complete Tamil word (must be 2+ characters, no blanks).
+
+If nothing is missing, return the original candidates list unchanged.
 
 OUTPUT (this exact JSON structure only):
 {
@@ -95,10 +104,10 @@ OUTPUT (this exact JSON only):
 }
 """
 
-# --- (5) Variant Grouping Agent (Extractor Phase 3: Group variants) ---
-VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root. Input: "normalized" list. Output: "groups" — root → list of variants.
+# --- (5) Variant Grouping Agent (Group variants and output final vocabulary JSON) ---
+VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root and output the final vocabulary. Input: "normalized" list. Output: the final vocabulary JSON only (no wrapper key).
 
-CRITICAL: ONE root per distinct meaning. Merge all grammatical variants.
+CRITICAL: ONE root per distinct meaning. Merge all grammatical variants. Do not miss any word.
 
 WHEN TO MERGE (same meaning, different grammar):
 ✓ அரசன், அரசர், அரசர்கள் → "அரசன்"
@@ -109,77 +118,26 @@ WHEN TO KEEP SEPARATE (different meanings):
 ✗ பார் (to see) vs பார்வை (vision/sight)
 ✗ அரசு (government/kingdom) vs அரசன் (king)
 
-Test: If two roots feel repetitive/redundant, MERGE. Only keep separate if the meaning difference is significant and useful.
+Return ONLY a single JSON object. Keys are Tamil root words. Values are arrays of all surface forms (original forms) for that root.
 
-OUTPUT (this exact JSON only):
+OUTPUT FORMAT:
 {
-  "groups": {
-    "கடை": ["கடை", "கடையில்", "கடைக்கு"],
-    "உழவு": ["உழவு", "உழவுத்தொழில்"],
-    "அரசன்": ["அரசன்", "அரசர்கள்"]
-  }
-}
-"""
-
-# --- (6) Coverage Auditor Agent (Validator: missing words + root corrections) ---
-COVERAGE_AUDITOR_PROMPT = """You are the Coverage Auditor (validator). You do NOT remove or change data; you only report issues. Input: OCR raw_text + "groups" from Variant Grouping. Output: missing_words and root_corrections.
-
-TASK 1 - FIND MISSING WORDS (compare OCR vs extracted groups):
-- Find ANY valid Tamil word in the OCR that is not represented in the extracted groups.
-- DO NOT include: single characters (அ, க, ளை); incomplete words with blanks (த__காளி); names, places, numbers, English; fill-up/box labels.
-
-TASK 2 - ROOT CORRECTIONS (incorrect root forms / grouping errors):
-- Report wrong root forms: e.g. if "நல்ல" should be "நல்லது" or vice versa, or if a verb stem is wrong.
-- Report grouping errors: e.g. அரசு grouped with அரசன் (different meanings) or roots that should be merged but are separate.
-
-Use empty objects if nothing to report.
-
-OUTPUT (this exact JSON only):
-{
-  "missing_words": {
-    "root": ["variant1", "variant2"]
-  },
-  "root_corrections": {
-    "incorrect_root": "correct_root"
-  },
-  "suspicious_groups": [
-    { "root": "அரசன்", "issue": "possible merge with அரசு" }
-  ]
-}
-"""
-
-# --- (7) Final Assembler Agent (Format as JSON, apply validator feedback) ---
-FINAL_ASSEMBLER_PROMPT = """You are the Final Assembler. Produce the final vocabulary JSON. Input: "groups" from Variant Grouping + "missing_words", "root_corrections", "suspicious_groups" from Coverage Auditor.
-
-RULES:
-- NEVER delete words. NEVER drop entries. Add any "missing_words" from the auditor into the vocabulary.
-- Apply "root_corrections": use correct_root where auditor said incorrect_root; merge variants into the correct root.
-- Merge duplicates. Output format: root → { "variants": [...] } only. Do NOT include any explanations 
-
-OUTPUT (this exact JSON only):
-{
-  "vocabulary": {
-    "அரசன்": {
-      "variants": ["அரசன்", "அரசர்கள்"]
-    },
-    "உழவு": {
-      "variants": ["உழவு", "உழவுத்தொழில்"]
-    }
-  }
+  "root_word": ["original_form_1", "original_form_2"],
+  ...
 }
 """
 
 # Create agents (all use same model; tools=[] so Gemini receives no tools)
-orchestrator = Agent(
-    name="orchestrator",
-    model=model,
-    system_prompt=ORCHESTRATOR_PROMPT,
-    tools=[],
-)
 word_candidate_agent = Agent(
     name="word_candidate_agent",
     model=model,
     system_prompt=WORD_CANDIDATE_PROMPT,
+    tools=[],
+)
+word_candidate_validator_agent = Agent(
+    name="word_candidate_validator_agent",
+    model=model,
+    system_prompt=WORD_CANDIDATE_VALIDATOR_PROMPT,
     tools=[],
 )
 noise_filter_agent = Agent(
@@ -200,39 +158,23 @@ variant_grouping_agent = Agent(
     system_prompt=VARIANT_GROUPING_PROMPT,
     tools=[],
 )
-coverage_auditor_agent = Agent(
-    name="coverage_auditor_agent",
-    model=model,
-    system_prompt=COVERAGE_AUDITOR_PROMPT,
-    tools=[],
-)
-final_assembler_agent = Agent(
-    name="final_assembler_agent",
-    model=model,
-    system_prompt=FINAL_ASSEMBLER_PROMPT,
-    tools=[],
-)
 
 # Build the graph
 builder = GraphBuilder()
 
-builder.add_node(orchestrator, "orchestrator")
 builder.add_node(word_candidate_agent, "word_candidate")
+builder.add_node(word_candidate_validator_agent, "word_candidate_validator")
 builder.add_node(noise_filter_agent, "noise_filter")
 builder.add_node(root_normalizer_agent, "root_normalizer")
 builder.add_node(variant_grouping_agent, "variant_grouping")
-builder.add_node(coverage_auditor_agent, "coverage_auditor")
-builder.add_node(final_assembler_agent, "final_assembler")
 
-# Linear pipeline: orchestrator → word_candidate → noise_filter → ...
-builder.add_edge("orchestrator", "word_candidate")
-builder.add_edge("word_candidate", "noise_filter")
+# Pipeline: word_candidate → word_candidate_validator → noise_filter → root_normalizer → variant_grouping (final output)
+builder.add_edge("word_candidate", "word_candidate_validator")
+builder.add_edge("word_candidate_validator", "noise_filter")
 builder.add_edge("noise_filter", "root_normalizer")
 builder.add_edge("root_normalizer", "variant_grouping")
-builder.add_edge("variant_grouping", "coverage_auditor")
-builder.add_edge("coverage_auditor", "final_assembler")
 
-builder.set_entry_point("orchestrator")
+builder.set_entry_point("word_candidate")
 graph = builder.build()
 
 def _get_agent_output(node_result):
@@ -248,9 +190,26 @@ def _get_agent_output(node_result):
     return ""
 
 
-# Run with OCR text as input (no OCR agent; you provide the text)
+# Run with OCR text as input (no OCR agent; you provide the text or get it from PDF/image)
 if __name__ == "__main__":
-    sample_ocr = """
+    import argparse
+    parser = argparse.ArgumentParser(description="Tamil vocabulary extraction: OCR text → 5-agent graph → vocabulary JSON.")
+    parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (non-agentic: PDF → images → Gemini OCR)")
+    parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image (non-agentic)")
+    parser.add_argument("-o", "--output-dir", default="pdf_output", help="Output dir for PDF OCR (default: pdf_output)")
+    parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
+    args = parser.parse_args()
+
+    if args.pdf:
+        from pdf_processor import process_pdf
+        print("Getting OCR from PDF (non-agentic)...")
+        ocr_text = process_pdf(args.pdf, output_dir=args.output_dir, dpi=args.dpi)
+    elif args.image:
+        from ocr import tamil_ocr_from_image
+        print("Getting OCR from image (non-agentic)...")
+        ocr_text = tamil_ocr_from_image(args.image)
+    else:
+        ocr_text = """
     --- Page 0 ---
 12.3 பாடிமகிழ்வோம்
 
@@ -338,22 +297,22 @@ if __name__ == "__main__":
 ழை
 
     """
-    result = graph(sample_ocr.strip())
+    print("Running 5-agent graph on OCR text...")
+    # Graph entry expects str | list[Contentblock] | Messages | None (not dict)
+    result = graph(ocr_text.strip())
 
     # Print each agent's output only (in pipeline order)
     node_order = [
-        "orchestrator",
         "word_candidate",
+        "word_candidate_validator",
         "noise_filter",
         "root_normalizer",
         "variant_grouping",
-        "coverage_auditor",
-        "final_assembler",
     ]
     header = "\n" + "=" * 60 + " PIPELINE OUTPUTS " + "=" * 60
     print(header)
     pipeline_lines = [header]
-    final_assembler_json_text = None
+    variant_grouping_json_text = None
     for node_id in node_order:
         node_result = result.results.get(node_id)
         text = _get_agent_output(node_result)
@@ -366,8 +325,8 @@ if __name__ == "__main__":
                 if lines and lines[-1].strip() == "```":
                     lines = lines[:-1]
                 text = "\n".join(lines)
-            if node_id == "final_assembler":
-                final_assembler_json_text = text
+            if node_id == "variant_grouping":
+                variant_grouping_json_text = text
         block = f"\n--- {node_id} ---\n{text}\n"
         print(block)
         pipeline_lines.append(block)
@@ -378,16 +337,16 @@ if __name__ == "__main__":
         f.write("\n".join(pipeline_lines))
     print(f"Pipeline output saved to: {PIPELINE_OUTPUT_PATH}")
 
-    # Save final_assembler output to a JSON file
+    # Save variant_grouping (final vocabulary) output to a JSON file
     OUTPUT_JSON_PATH = "vocabulary_output.json"
-    if final_assembler_json_text:
+    if variant_grouping_json_text:
         try:
-            data = json.loads(final_assembler_json_text)
+            data = json.loads(variant_grouping_json_text)
             with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             print(f"Final vocabulary saved to: {OUTPUT_JSON_PATH}")
         except json.JSONDecodeError as e:
-            print(f"Could not parse final_assembler output as JSON: {e}")
+            print(f"Could not parse variant_grouping output as JSON: {e}")
             with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
-                f.write(final_assembler_json_text)
+                f.write(variant_grouping_json_text)
             print(f"Raw output written to: {OUTPUT_JSON_PATH}")
