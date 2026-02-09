@@ -64,6 +64,47 @@ def pdf_to_ocr_text(
     return "\n\n".join(all_ocr_text)
 
 
+def get_ocr_per_page(
+    pdf_path: str,
+    output_dir: str | None = "pdf_output",
+    dpi: int = 300,
+) -> list[str]:
+    """
+    Convert a PDF to images page by page, run Tamil OCR on each, return one OCR string per page.
+
+    Returns:
+        List of OCR text strings; index i is page i (0-based in list, 1-based for display).
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    pdf = fitz.open(pdf_path)
+    pages = len(pdf)
+    page_texts = []
+
+    for page_num in range(pages):
+        print(f"Processing page {page_num + 1}/{pages} ...", flush=True)
+        page = pdf[page_num]
+        pix = page.get_pixmap(dpi=dpi)
+        temp_image = os.path.join(output_dir, f"page_{page_num + 1}.png")
+        pix.save(temp_image)
+
+        page_text = tamil_ocr_from_image(temp_image)
+        if page_text.startswith("Error:"):
+            print(f"  Warning: {page_text}", flush=True)
+        page_texts.append(page_text.strip())
+
+        try:
+            os.remove(temp_image)
+        except OSError:
+            pass
+
+    pdf.close()
+    return page_texts
+
+
 def process_pdf(
     pdf_path: str,
     output_dir: str = "pdf_output",

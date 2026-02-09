@@ -193,21 +193,31 @@ def _get_agent_output(node_result):
 # Run with OCR text as input (no OCR agent; you provide the text or get it from PDF/image)
 if __name__ == "__main__":
     import argparse
+    from pathlib import Path as PathLib
     parser = argparse.ArgumentParser(description="Tamil vocabulary extraction: OCR text → 5-agent graph → vocabulary JSON.")
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (non-agentic: PDF → images → Gemini OCR)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image (non-agentic)")
-    parser.add_argument("-o", "--output-dir", default="pdf_output", help="Output dir for PDF OCR (default: pdf_output)")
+    parser.add_argument("-o", "--output-dir", default="pdf_output", help="Output dir for pipeline and vocabulary (default: pdf_output)")
     parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
     args = parser.parse_args()
 
+    # Build list of OCR texts: one per page (PDF = multiple pages, image/sample = one page)
     if args.pdf:
-        from pdf_processor import process_pdf
-        print("Getting OCR from PDF (non-agentic)...")
-        ocr_text = process_pdf(args.pdf, output_dir=args.output_dir, dpi=args.dpi)
+        from pdf_processor import get_ocr_per_page
+        print("Getting OCR from PDF (non-agentic, page by page)...")
+        pages_ocr = get_ocr_per_page(args.pdf, output_dir=args.output_dir, dpi=args.dpi)
+        # Save combined OCR for reference
+        pdf_name = PathLib(args.pdf).stem
+        combined_path = os.path.join(args.output_dir, f"{pdf_name}_full_ocr.txt")
+        combined = "\n\n".join(f"--- Page {i} ---\n{t}" for i, t in enumerate(pages_ocr, start=1))
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+        print(f"✓ OCR saved to: {combined_path}")
     elif args.image:
         from ocr import tamil_ocr_from_image
         print("Getting OCR from image (non-agentic)...")
-        ocr_text = tamil_ocr_from_image(args.image)
+        pages_ocr = [tamil_ocr_from_image(args.image)]
     else:
         ocr_text = """
     --- Page 0 ---
@@ -297,11 +307,9 @@ if __name__ == "__main__":
 ழை
 
     """
-    print("Running 5-agent graph on OCR text...")
-    # Graph entry expects str | list[Contentblock] | Messages | None (not dict)
-    result = graph(ocr_text.strip())
+        pages_ocr = [ocr_text.strip()]
 
-    # Print each agent's output only (in pipeline order)
+    os.makedirs(args.output_dir, exist_ok=True)
     node_order = [
         "word_candidate",
         "word_candidate_validator",
@@ -310,43 +318,53 @@ if __name__ == "__main__":
         "variant_grouping",
     ]
     header = "\n" + "=" * 60 + " PIPELINE OUTPUTS " + "=" * 60
-    print(header)
-    pipeline_lines = [header]
-    variant_grouping_json_text = None
-    for node_id in node_order:
-        node_result = result.results.get(node_id)
-        text = _get_agent_output(node_result)
-        if text:
-            # Strip markdown code fence for cleaner display / parsing
-            if text.startswith("```"):
-                lines = text.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-            if node_id == "variant_grouping":
-                variant_grouping_json_text = text
-        block = f"\n--- {node_id} ---\n{text}\n"
-        print(block)
-        pipeline_lines.append(block)
+    page_vocabularies = []
 
-    # Save full pipeline output to a text file
-    PIPELINE_OUTPUT_PATH = "pipeline_output.txt"
-    with open(PIPELINE_OUTPUT_PATH, "w", encoding="utf-8") as f:
-        f.write("\n".join(pipeline_lines))
-    print(f"Pipeline output saved to: {PIPELINE_OUTPUT_PATH}")
+    for page_num, page_text in enumerate(pages_ocr, start=1):
+        print(f"Running 5-agent graph for page {page_num}/{len(pages_ocr)}...")
+        result = graph(page_text)
+        pipeline_lines = [header]
+        variant_grouping_json_text = None
+        for node_id in node_order:
+            node_result = result.results.get(node_id)
+            text = _get_agent_output(node_result)
+            if text:
+                if text.startswith("```"):
+                    lines = text.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    text = "\n".join(lines)
+                if node_id == "variant_grouping":
+                    variant_grouping_json_text = text
+            block = f"\n--- {node_id} ---\n{text}\n"
+            print(block)
+            pipeline_lines.append(block)
+        page_path = os.path.join(args.output_dir, f"page{page_num}_pipeline_output.txt")
+        with open(page_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(pipeline_lines))
+        print(f"Pipeline output saved to: {page_path}")
+        if variant_grouping_json_text:
+            try:
+                data = json.loads(variant_grouping_json_text)
+                page_vocabularies.append(data)
+            except json.JSONDecodeError:
+                pass
 
-    # Save variant_grouping (final vocabulary) output to a JSON file
-    OUTPUT_JSON_PATH = "vocabulary_output.json"
-    if variant_grouping_json_text:
-        try:
-            data = json.loads(variant_grouping_json_text)
-            with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            print(f"Final vocabulary saved to: {OUTPUT_JSON_PATH}")
-        except json.JSONDecodeError as e:
-            print(f"Could not parse variant_grouping output as JSON: {e}")
-            with open(OUTPUT_JSON_PATH, "w", encoding="utf-8") as f:
-                f.write(variant_grouping_json_text)
-            print(f"Raw output written to: {OUTPUT_JSON_PATH}")
+    # Merge all page vocabularies: same root → union of variant lists, no duplicates
+    merged = {}
+    for vocab in page_vocabularies:
+        if not isinstance(vocab, dict):
+            continue
+        for root, forms in vocab.items():
+            if not isinstance(forms, list):
+                continue
+            merged.setdefault(root, []).extend(forms)
+    for root in merged:
+        merged[root] = list(dict.fromkeys(merged[root]))
+
+    output_json_path = os.path.join(args.output_dir, "vocabulary_output.json")
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    print(f"Final vocabulary (merged, deduped) saved to: {output_json_path}")

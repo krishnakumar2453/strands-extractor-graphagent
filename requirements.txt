@@ -1,3 +1,6 @@
 strands-agents[gemini]
 strands-agents-tools
 google-genai
+google-generativeai
+Pillow
+PyMuPDF
