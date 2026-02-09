@@ -18,10 +18,10 @@ model = GeminiModel(
 )
 
 # --- (1) Word Candidate Agent (Extractor Phase 1: Identify ALL candidates) ---
-WORD_CANDIDATE_PROMPT = """You are a Tamil language expert. Your job is to identify ALL Tamil word candidates from the OCR text (Phase 1 only: extraction, no discard or root reduction).
+WORD_CANDIDATE_PROMPT = """You are a Tamil language expert. Your job is to - Extract all Tamil words exactly as they appear in the OCR text.
 
-INPUT: You receive the raw OCR text (the full Tamil textbook excerpt as a single string). Include that exact raw text in your output as "raw_text" so the next agent can use it.
 
+INPUT: You receive the raw OCR text (a textbook page excerpt as a single string).
 READING METHOD:
 - Read line by line, word by word. Do NOT skip any section.
 - OCR text is the primary source. NEVER invent words. NEVER reduce to root or group.
@@ -40,72 +40,98 @@ Output a flat list of every Tamil word candidate you see. Recall over precision:
 
 OUTPUT (this exact JSON structure only):
 {
-  "candidates": ["விவசாயத்தில்", "உழவுத்தொழில்", "மக்கள்", "..."],
+  "candidates": ["word1", "word2", "word3", "..."],
   "raw_text": "the full OCR Tamil text exactly as received"
 }
 """
 
 # --- (2) Word Candidate Validator Agent (TASK 1 only: find missing words) ---
-WORD_CANDIDATE_VALIDATOR_PROMPT = """You are reviewing the Word Candidate agent output. Your ONLY task is to find ANY missing valid Tamil words from the OCR that were not extracted in the candidates list.
+WORD_CANDIDATE_VALIDATOR_PROMPT = """You are reviewing the Word Candidate agent output.
+ Your ONLY task is to find ANY missing valid Tamil words from the OCR that were not extracted in the candidates list.
 
 INPUT: You receive (1) "raw_text" and (2) "candidates" from the Word Candidate agent output.
 
 TASK - FIND MISSING WORDS (HIGH PRIORITY):
-1. Compare the OCR text against the extracted candidates and find ANY missing valid Tamil words.
-2. Output a single merged list: original candidates plus any valid missing words, with no duplicates.
+1. Compare the OCR text (raw_text) against the extracted candidates and find ANY missing valid Tamil words.
+2. Look very careful, check line by line.
+3. if a valid missing word is found add that to the candidates list and return the list.
+4. Output a single merged list with no duplicates.
 
 YOU MUST NOT INCLUDE AS MISSING WORDS:
 - Single characters (e.g. அ, ஆ, க, ங, ள, ளை, ழ, ற).
+- Meaningless words (e.g. க்கு, ஆல், லிளி)
 - Incomplete words with blanks or dashes (e.g. த__காளி, சன்_ல்).
-- People names (e.g. விஜய், கார்த்திக், மின்னி, தூரன்).
-- Place names (e.g. சென்னை, தமிழ்நாடு).
-- Numbers (e.g. 12.3, 1, 2).
-- English text.
-- Punctuation or symbols.
+- People names (e.g. விஜய், கார்த்திக்).
+- City, Country, Place names (e.g. சென்னை, தமிழ்நாடு).
+- Punctuation, symbols OR Numbers (e.g. 12.3, 1, 2).
+- English  or other language text.
 - Labels inside fill-up boxes, tables, or activity frames (e.g. வட்டமிடு, சொல் உறுவாக்குவோம் when used as box instructions).
-- Any token that is not a valid, complete Tamil word (must be 2+ characters, no blanks).
 
-If nothing is missing, return the original candidates list unchanged.
+
+IF NOTHING IS MISSING RETURN THE ORIGINAL CANDIDATES LIST UNCHANGED.
+IF MISSING ADD MISSING WORDS TO CANDIDATES LIST .
+
+**IMPORTANT : YOU SHOULD ONLY ABLE TO ADD MISSING WORDS TO THE CANDIDATES LIST.NOT TO REMOVE, CHANGE, OR MISS WHILE RETURNING THE CANDIDATES LIST**
 
 OUTPUT (this exact JSON structure only):
 {
-  "candidates": ["விவசாயத்தில்", "உழவுத்தொழில்", "மக்கள்", "..."]
+  "candidates": ["word1", "word2", "word3", "..."]
 }
 """
 
 # --- (3) Noise Filter Agent (Extractor Phase 2: Apply discard rules) ---
-NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Apply DISCARD RULES only. Input: "candidates". Output: "clean_words" — only authentic Tamil words.
+NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your task is to remove obvious non-lexical noise from a list of Tamil word candidates ONLY IF PRESENT.
 
-DISCARD (remove): Single Tamil characters (அ, க, ள, etc.); uyirmei fragments that are not words; fill-up placeholders (____, சன்_ல், த__காளி); people names (விஜய், கார்த்திக்); place names (சென்னை, தமிழ்நாடு); numbers, punctuation, English; diagram/table artifacts; incomplete words. KEEP: valid Tamil words (2+ chars, no blanks). If unsure → KEEP.
+Input: "candidates". Output: "filtered_candidates" — only authentic Tamil words.
+
+
+YOU SHOULD ONLY REMOVE:
+
+- Blanks, placeholders, or fill-ups (____, ___ல், த__காளி)
+- Single Tamil characters (அ, க, ள)
+- Pure numbers,symbols or punctuation
+- Table/diagram artifacts
+
+YOU ARE NOT ALLOWED TO REMOVE OTHER THAT THE ABOVE 4 CATEGORIES.
+WORDS IN CANDIDATE_LIST ARE VERY IMPORTANT AND SHOULD NOT BE REMOVED OR MISS WHILE RETURNING.
 
 OUTPUT (this exact JSON only):
 {
-  "clean_words": ["விவசாயத்தில்", "உழவுத்தொழில்", "மக்கள்"]
+  "filtered_candidates": ["word1", "word2", "word3", "..."]
 }
 """
 
 # --- (4) Root Normalizer Agent (Extractor Phase 3: Find root words) ---
-ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Convert each Tamil word to its dictionary base/root form. Input: "clean_words". Output: "normalized" list of { "root", "form" }. One word → one root. NEVER delete a word. NEVER merge different meanings.
+ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Convert each Tamil word to its dictionary base/root form.
+ Input: "filtered_candidates". Output: "normalized" list of { "root", "form" }. One word → one root. NEVER delete a word. NEVER merge different meanings.
 
+ 
 ROOT WORD RULES:
 - Remove suffixes: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, etc. Return dictionary base form.
 - NOUNS → singular nominative (e.g. அரசன், மணம், நிறம்).
 - VERBS → verb stem (e.g. செல், பார், இரு).
 - ADJECTIVES → base form (e.g. புதிய).
-- Same root with different case markers → one root (e.g. நிலப்பகுதி, நிலப்பகுதியை, நிலப்பகுதியின் → root நிலப்பகுதி).
+- Negative/participial forms (e.g. தோன்றாது) → root must be corresponding negative stem (தோன்றாத), not the positive stem (தோன்று).
+
+
+IMPORTANT : YOU ARE NOT ALLOWED TO REMOVE ANY WORD FROM THE CANDIDATES LIST. 
+WORDS IN Filtered candidates are very important so do not remove ,miss any entry while returning 
+
 
 OUTPUT (this exact JSON only):
 {
   "normalized": [
-    { "root": "விவசாயம்", "form": "விவசாயத்தில்" },
-    { "root": "உழவு", "form": "உழவுத்தொழில்" },
-    { "root": "மக்கள்", "form": "மக்கள்" }
+    { "root": "root_word", "form": "original_form" },
+    ...
   ]
 }
+ 
+ 
 """
 
 # --- (5) Variant Grouping Agent (Group variants and output final vocabulary JSON) ---
 VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root and output the final vocabulary. Input: "normalized" list. Output: the final vocabulary JSON only (no wrapper key).
+Your task is to group word forms under a single Tamil root ONLY when they share the same meaning.
 
 CRITICAL: ONE root per distinct meaning. Merge all grammatical variants. Do not miss any word.
 
@@ -117,6 +143,10 @@ WHEN TO MERGE (same meaning, different grammar):
 WHEN TO KEEP SEPARATE (different meanings):
 ✗ பார் (to see) vs பார்வை (vision/sight)
 ✗ அரசு (government/kingdom) vs அரசன் (king)
+
+At First the spelling should little bit same and they convey same meaning.
+If two roots feel repetitive or redundant, MERGE them.
+Only keep separate if the meaning difference is significant and useful.
 
 Return ONLY a single JSON object. Keys are Tamil root words. Values are arrays of all surface forms (original forms) for that root.
 
@@ -158,22 +188,17 @@ variant_grouping_agent = Agent(
     system_prompt=VARIANT_GROUPING_PROMPT,
     tools=[],
 )
-
 # Build the graph
 builder = GraphBuilder()
-
 builder.add_node(word_candidate_agent, "word_candidate")
 builder.add_node(word_candidate_validator_agent, "word_candidate_validator")
 builder.add_node(noise_filter_agent, "noise_filter")
 builder.add_node(root_normalizer_agent, "root_normalizer")
 builder.add_node(variant_grouping_agent, "variant_grouping")
-
-# Pipeline: word_candidate → word_candidate_validator → noise_filter → root_normalizer → variant_grouping (final output)
 builder.add_edge("word_candidate", "word_candidate_validator")
 builder.add_edge("word_candidate_validator", "noise_filter")
 builder.add_edge("noise_filter", "root_normalizer")
 builder.add_edge("root_normalizer", "variant_grouping")
-
 builder.set_entry_point("word_candidate")
 graph = builder.build()
 
@@ -201,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
     args = parser.parse_args()
 
-    # Build list of OCR texts: one per page (PDF = multiple pages, image/sample = one page)
+    # Build list of OCR texts: one per page (PDF = multiple pages, image = one page)
     if args.pdf:
         from pdf_processor import get_ocr_per_page
         print("Getting OCR from PDF (non-agentic, page by page)...")
@@ -219,95 +244,8 @@ if __name__ == "__main__":
         print("Getting OCR from image (non-agentic)...")
         pages_ocr = [tamil_ocr_from_image(args.image)]
     else:
-        ocr_text = """
-    --- Page 0 ---
-12.3 பாடிமகிழ்வோம்
+        parser.error("Input required: use --pdf PATH or --image PATH to provide a PDF or image for OCR.")
 
-மின்னி மின்னி வானத்தில்
-
-மின்னும் மின்மினி போலவே
-மின்னி மின்னி வானத்தில்
-என்னை உற்றுப் பார்த்திடும்
-சின்னச் சின்ன மீன்களே
-
-என்ன அங்கே செய்கின்றீர்?
-எப்படித் தான் நிற்கிறீர்?
-
-அன்னை கழுத்தில் அணிந்திடும்
-அழகு வைர மாலையில்
-
-மின்னும் மணிகள் போலவும்
-வெள்ளை முத்தைப் போலவும்
-பொன்னுப் பூவைப் போலவும்
-மின்னிச் சிரிக்கும் மீன்களே
-
-எட்ட நின்று பார்க்கிறீர்
-இரவில் மேலே வருகிறீர்
-பட்டப் பகலில் எங்குதான்
-பறந்து செல்வீர் கூறுங்கள்
-
--பெ. தூரன்
-
---- Page 1 ---
-12.4 தெரிந்துகொள்வோம்
-ல, ழ, ள ஒலிவேறுபாடு
-
-சிலம்பம் ஒரு கலை.
-
-வயலில் களை பறித்தார்.
-
-கூடைகள் செய்யக் கழை பயன்படுகிறது.
-
-கடல் அலையில் விளையாடினான்.
-
-பாம்பு அளையிலிருந்து வெளியே வந்தது.
-
-அம்மா குழந்தையை அழைத்தார்.
-
---- Page 2 ---
-எனக்கு முழங்காலில் வலி.
-
-வளியால் மரங்கள் அசைந்தன.
-
-இது நான் போகும் வழி.
-
-கிளிக்குக் கூர்மையான அலகு உண்டு.
-
-அளகு அடைகாக்கிறது.
-
-வானுக்கு நிலவு அழகு.
-
---- Page 3 ---
-பொருள் அறிவோம்
-
-1. களை - தேவையற்ற செடிகள்
-2. கழை - மூங்கில்
-3. அளை - புற்று
-4. அழை - கூப்பிடுதல்
-5. வளி - காற்று
-6. வழி - பாதை
-7. அலகு - பறவையின் மூக்கு
-8. அளகு - கோழி
-பயிற்சி
-பொருத்தமான எழுத்தை எடுத்து எழுதுக.
-2
-அ
-ளை ழை
-க
-ளை
-ழை
-வ
-லி
-ளி
-ழி
-ള
-ழ
-அ
-ளை
-ழை
-
-    """
-        pages_ocr = [ocr_text.strip()]
 
     os.makedirs(args.output_dir, exist_ok=True)
     node_order = [
