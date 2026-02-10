@@ -4,16 +4,40 @@ from strands.multiagent import GraphBuilder
 from strands import Agent
 import json
 import os
+import sys
+from typing import Any
+
 from dotenv import load_dotenv
+from google import genai
 from strands.models.gemini import GeminiModel
 
 load_dotenv()
 
-model = GeminiModel(
+
+class _GeminiModelNoEmptyTools(GeminiModel):
+    """Subclass that omits the tools key when there are no tools, so Gemini API does not reject the request (400)."""
+
+    def _format_request_config(
+        self,
+        tool_specs: list[Any] | None,
+        system_prompt: str | None,
+        params: dict[str, Any] | None,
+    ) -> genai.types.GenerateContentConfig:
+        formatted_tools = self._format_request_tools(tool_specs)
+        config_kw: dict[str, Any] = {
+            "system_instruction": system_prompt,
+            **(params or {}),
+        }
+        if formatted_tools:
+            config_kw["tools"] = formatted_tools
+        return genai.types.GenerateContentConfig(**config_kw)
+
+
+model = _GeminiModelNoEmptyTools(
     client_args={"api_key": os.getenv("GEMINI_API_KEY")},
     model_id="gemini-2.0-flash",
     params={
-        "temperature": 0.3
+        "temperature": 0,
     },
 )
 
@@ -226,6 +250,10 @@ if __name__ == "__main__":
     parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
     args = parser.parse_args()
 
+    if not os.getenv("GEMINI_API_KEY"):
+        print("Error: GEMINI_API_KEY is not set. Set it in .env or the environment.", file=sys.stderr)
+        sys.exit(1)
+
     # Build list of OCR texts: one per page (PDF = multiple pages, image = one page)
     if args.pdf:
         from pdf_processor import get_ocr_per_page
@@ -257,10 +285,16 @@ if __name__ == "__main__":
     ]
     header = "\n" + "=" * 60 + " PIPELINE OUTPUTS " + "=" * 60
     page_vocabularies = []
+    graph_failed = False
 
     for page_num, page_text in enumerate(pages_ocr, start=1):
         print(f"Running 5-agent graph for page {page_num}/{len(pages_ocr)}...")
-        result = graph(page_text)
+        try:
+            result = graph(page_text)
+        except Exception as e:
+            print(f"Error on page {page_num}: {e}", file=sys.stderr)
+            graph_failed = True
+            break
         pipeline_lines = [header]
         variant_grouping_json_text = None
         for node_id in node_order:
@@ -305,4 +339,9 @@ if __name__ == "__main__":
     output_json_path = os.path.join(args.output_dir, "vocabulary_output.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
+    root_count = len(merged)
     print(f"Final vocabulary (merged, deduped) saved to: {output_json_path}")
+    print(f"Root words count: {root_count}")
+
+    if graph_failed:
+        sys.exit(1)
