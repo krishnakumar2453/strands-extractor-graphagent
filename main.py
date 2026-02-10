@@ -274,6 +274,7 @@ if __name__ == "__main__":
     else:
         parser.error("Input required: use --pdf PATH or --image PATH to provide a PDF or image for OCR.")
 
+    input_basename = PathLib(args.pdf).stem if args.pdf else PathLib(args.image).stem
 
     os.makedirs(args.output_dir, exist_ok=True)
     node_order = [
@@ -313,7 +314,7 @@ if __name__ == "__main__":
             block = f"\n--- {node_id} ---\n{text}\n"
             print(block)
             pipeline_lines.append(block)
-        page_path = os.path.join(args.output_dir, f"page{page_num}_pipeline_output.txt")
+        page_path = os.path.join(args.output_dir, f"{input_basename}_page{page_num}_pipeline_output.txt")
         with open(page_path, "w", encoding="utf-8") as f:
             f.write("\n".join(pipeline_lines))
         print(f"Pipeline output saved to: {page_path}")
@@ -336,7 +337,7 @@ if __name__ == "__main__":
     for root in merged:
         merged[root] = list(dict.fromkeys(merged[root]))
 
-    output_json_path = os.path.join(args.output_dir, "vocabulary_output.json")
+    output_json_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
     root_count = len(merged)
