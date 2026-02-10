@@ -104,19 +104,23 @@ OUTPUT (this exact JSON structure only):
 """
 
 # --- (3) Noise Filter Agent (Extractor Phase 2: Apply discard rules) ---
-NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your task is to remove obvious non-lexical noise from a list of Tamil word candidates ONLY IF PRESENT.
+NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to remove obvious non-lexical noise and unwanted entries from a list of Tamil word candidates ONLY IF PRESENT.
 
 Input: "candidates". Output: "filtered_candidates" — only authentic Tamil words.
 
 
-YOU SHOULD ONLY REMOVE:
+REMOVE ONLY THESE 5 CATEGORIES (if present). Do NOT remove anything else:
 
-- Blanks, placeholders, or fill-ups (____, ___ல், த__காளி)
-- Single Tamil characters (அ, க, ள)
-- Pure numbers,symbols or punctuation
-- Table/diagram artifacts
+1. Blanks, placeholders, or fill-ups (e.g. ____, ___ல், த__காளி, சன்_ல்).
+2. Proper nouns and name-like noise:
+   - Person names (e.g. விஜய், கார்த்திக், கிறிஸ்டோபர், கொலம்பஸ் ).
+   - Place, country, and city names (e.g. அமெரிக்கா, சென்னை, தமிழ்நாடு).
+   - Writer or author names, and author initials (e.g. ஓடா, or single-letter/byline initials).
+3. Single Tamil characters (e.g. அ, ஆ, க, ள, ங).
+4. Pure numbers, symbols, or punctuation.
+5. Table/diagram artifacts (labels or fragments that are not real words).
 
-YOU ARE NOT ALLOWED TO REMOVE OTHER THAT THE ABOVE 4 CATEGORIES.
+YOU ARE NOT ALLOWED TO REMOVE OTHER THAT THE ABOVE 5 CATEGORIES.
 WORDS IN CANDIDATE_LIST ARE VERY IMPORTANT AND SHOULD NOT BE REMOVED OR MISS WHILE RETURNING.
 
 OUTPUT (this exact JSON only):
@@ -124,6 +128,7 @@ OUTPUT (this exact JSON only):
   "filtered_candidates": ["word1", "word2", "word3", "..."]
 }
 """
+
 
 # --- (4) Root Normalizer Agent (Extractor Phase 3: Find root words) ---
 ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Convert each Tamil word to its dictionary base/root form.
