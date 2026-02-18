@@ -8,3 +8,5 @@ __pycache__/
 images/*.png
 pdf_output/
 *_extracted.txt
+compare_output/
+test_images/
