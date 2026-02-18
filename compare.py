@@ -87,6 +87,11 @@ def main() -> int:
         default=DEFAULT_TESTCASES_DIR,
         help=f"Directory containing baseline root_output.json per PDF (default: {DEFAULT_TESTCASES_DIR})",
     )
+    parser.add_argument(
+        "--pdf",
+        metavar="BASENAME",
+        help="Compare only this PDF (basename, e.g. test_pdf1). File must be in --pdf-dir. Omit to compare all PDFs.",
+    )
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parent
     pdf_dir = (args.pdf_dir if args.pdf_dir.is_absolute() else repo_root / args.pdf_dir)
@@ -97,6 +102,11 @@ def main() -> int:
     if not pdfs:
         print(f"No PDFs found in {pdf_dir}", file=sys.stderr)
         return 1
+    if args.pdf:
+        pdfs = [p for p in pdfs if p.stem == args.pdf]
+        if not pdfs:
+            print(f"No PDF found with basename '{args.pdf}' in {pdf_dir}. Use the filename without .pdf (e.g. test_pdf1).", file=sys.stderr)
+            return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     any_fail = False
@@ -129,15 +139,26 @@ def main() -> int:
             print(f"[{basename}] OK")
             continue
 
-        # Report only diffs
-        print(f"[{basename}] DIFF:")
+        # Build diff report (print and save to compare_output)
+        report_lines = [
+            f"[{basename}] DIFF:",
+        ]
         if missed_roots:
-            print(f"  missed roots: {missed_roots}")
+            report_lines.append(f"  missed roots: {missed_roots}")
         if extra_roots:
-            print(f"  extra roots: {extra_roots}")
+            report_lines.append(f"  extra roots: {extra_roots}")
         if different:
             for root, missed_forms, extra_forms in different:
-                print(f"  different '{root}': missed_forms {missed_forms}, extra_forms {extra_forms}")
+                report_lines.append(f"  different '{root}': missed_forms {missed_forms}, extra_forms {extra_forms}")
+        report_text = "\n".join(report_lines)
+        for line in report_lines:
+            print(line)
+        diff_path = output_dir / f"{basename}_diff.txt"
+        try:
+            diff_path.write_text(report_text, encoding="utf-8")
+            print(f"  (saved to {diff_path})")
+        except OSError as e:
+            print(f"  (failed to save diff: {e})", file=sys.stderr)
         if missed_roots or different:
             any_fail = True
 
