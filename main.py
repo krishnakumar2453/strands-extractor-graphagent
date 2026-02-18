@@ -5,6 +5,7 @@ from strands import Agent
 import json
 import os
 import sys
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -15,7 +16,10 @@ load_dotenv()
 
 
 class _GeminiModelNoEmptyTools(GeminiModel):
-    """Subclass that omits the tools key when there are no tools, so Gemini API does not reject the request (400)."""
+    """Subclass that omits the tools key when there are no tools, so Gemini API does not reject the request (400).
+    The base GeminiModel always returns a list with one Tool; when tool_specs is empty that Tool has empty
+    function_declarations, which serializes with no tool_type set and triggers 'tools[0].tool_type must have one
+    initialized field'. We only add tools when we actually have tool_specs."""
 
     def _format_request_config(
         self,
@@ -23,13 +27,14 @@ class _GeminiModelNoEmptyTools(GeminiModel):
         system_prompt: str | None,
         params: dict[str, Any] | None,
     ) -> genai.types.GenerateContentConfig:
-        formatted_tools = self._format_request_tools(tool_specs)
         config_kw: dict[str, Any] = {
             "system_instruction": system_prompt,
             **(params or {}),
         }
-        if formatted_tools:
-            config_kw["tools"] = formatted_tools
+        if tool_specs:
+            formatted_tools = self._format_request_tools(tool_specs)
+            if formatted_tools:
+                config_kw["tools"] = formatted_tools
         return genai.types.GenerateContentConfig(**config_kw)
 
 
@@ -40,6 +45,7 @@ model = _GeminiModelNoEmptyTools(
         "temperature": 0,
     },
 )
+
 
 # --- (1) Word Candidate Agent (Extractor Phase 1: Identify ALL candidates) ---
 WORD_CANDIDATE_PROMPT = """You are a Tamil language expert. Your job is to - Extract all Tamil words exactly as they appear in the OCR text.
@@ -134,18 +140,17 @@ ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Convert each Tami
 
  
 ROOT WORD RULES:
-- Strip all grammatical suffixes and return only the base form. Suffixes include: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம் , ஒடு/ஓடு, அது ,வாறு, ஆன, ஆனது, பட்டது,ள்ளது,கின்றனர் etc,.
- Root must never be the inflected form (e.g. இவ்வாறாகப் → root இவ்வாறு; பதினெட்டாம் → பதினெட்டு; வகுப்பில் → வகுப்பு; ஓரமாக → ஓரம்; மொழியொடு → மொழி; சிறந்தது → சிறந்த; அறியாதவாறு → அறியாத;மென்மையான → மென்மை; மென்மையானது → மென்மை; சேர்க்கப்பட்டது → சேர் ;சேர்த்துள்ளது → சேர் ).
+- Strip all grammatical suffixes and return only the base form. Suffixes include: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம் , ஒடு/ஓடு, அது ,வாறு etc,.
+ Root must never be the inflected form (e.g. இவ்வாறாகப் → root இவ்வாறு; பதினெட்டாம் → பதினெட்டு; வகுப்பில் → வகுப்பு; ஓரமாக → ஓரம்; மொழியொடு → மொழி; சிறந்தது → சிறந்த; அறியாதவாறு → அறியாத).
 - NOUNS → singular nominative (e.g. அரசன், மணம், நிறம்).
 - VERBS → verb stem (e.g. செல், பார், இரு).
 - Passive/compound verb forms (e.g. அழைக்கப்படுகிறார், கொண்டிருந்தான் ) → root = verb stem only: strip -க்கப்படு, -யப்பட்டு, -ப்பட்டிருந்தன, -ப்படுகிறார், etc. and return the stem (அழைக்கப்படு, கொண்டிரு).
 - ADJECTIVES → base form (e.g. புதிய).
+- Negative/participial forms (e.g. தோன்றாது) → root must be corresponding negative stem (தோன்றாத), not the positive stem (தோன்று).
 
 IMPORTANT : YOU ARE NOT ALLOWED TO REMOVE ANY WORD FROM THE CANDIDATES LIST. 
 WORDS IN Filtered candidates are very important so do not remove ,miss any entry while returning 
 
-COMPLETENESS: Output exactly one { "root", "form" } entry for every word in filtered_candidates. The length of "normalized" must equal the length of filtered_candidates. 
-Include every form as a separate entry even when it differs only slightly from its root (e.g. one suffix or a minor spelling change). Do not omit a form because it resembles the root or duplicates the root string—each candidate word must appear exactly once as "form" with its root.
 
 OUTPUT (this exact JSON only):
 {
@@ -157,30 +162,36 @@ OUTPUT (this exact JSON only):
  
  
 """
-# --- (5) Variant Grouping Agent (merge same roots, list all forms) ---
-VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Your ONLY task is to merge entries by root and list all forms.
 
-Input: "normalized" — a list of objects, each with "root" and "form" (from the Root Normalizer).
-Task: For each unique "root" value, collect ALL "form" values that have that root. One root → one key; value = list of every form that had that root. Do not group by meaning or similarity. Do not merge different roots. Same root string → merge into one list; different root string → separate keys.
 
-Rules:
-- Each key in the output is a root that appeared in the normalized list.
-- Each value is the list of all "form" values whose "root" was that key.
-- If the same (root, form) appears more than once, include that form only once in the list.
-- Do not add or remove roots; do not combine two different roots into one. The normalizer already assigned the root; you only aggregate by that root.
+# --- (5) Variant Grouping Agent (Group variants and output final vocabulary JSON) ---
+VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root and output the final vocabulary. Input: "normalized" list. Output: the final vocabulary JSON only (no wrapper key).
+Your task is to group word forms under a single Tamil root ONLY when they share the same meaning.
 
-Example:
-Input normalized: [ {"root": "அரசன்", "form": "அரசன்"}, {"root": "அரசன்", "form": "அரசர்கள்"}, {"root": "கடை", "form": "கடை"} ]
-Output: { "அரசன்": ["அரசன்", "அரசர்கள்"], "கடை": ["கடை"] }
+CRITICAL: ONE root . Merge all grammatical variants. Do not miss any word.
 
-Return ONLY a single JSON object. Keys = Tamil root words. Values = arrays of form strings for that root.
+WHEN TO MERGE (same initial spelling, same meaning, different grammar):
+✓ அரசன், அரசர், அரசர்கள் → "அரசன்"
+✓ இரு, இருக்கும், இருப்பது, இருந்தது → "இரு"
+✓ கடை, கடையில், கடைக்கு → "கடை"
+
+WHEN TO KEEP SEPARATE (different meanings):
+✗ பார் (to see) vs பார்வை (vision/sight)
+✗ அரசு (government/kingdom) vs அரசன் (king)
+
+At First the spelling should little bit same and they convey same meaning.
+If two roots feel repetitive or redundant, MERGE them.
+Only keep separate if the meaning difference is significant and useful.
+
+Return ONLY a single JSON object. Keys are Tamil root words. Values are arrays of all surface forms (original forms) for that root.
 
 OUTPUT FORMAT:
 {
-  "root_word": ["form_1", "form_2", ...],
+  "root_word": ["original_form_1", "original_form_2"],
   ...
 }
 """
+
 
 
 # Create agents (all use same model; tools=[] so Gemini receives no tools)
@@ -326,6 +337,11 @@ if __name__ == "__main__":
                 page_vocabularies.append(data)
             except json.JSONDecodeError:
                 pass
+
+        # Rate limit: 30 s break after every 2 pages (skip after last page)
+        if page_num % 2 == 0 and page_num < len(pages_ocr):
+            print("Waiting 30 s (rate limit)...", flush=True)
+            time.sleep(30)
 
     # Merge all page vocabularies: same root → union of variant lists, no duplicates
     merged = {}
