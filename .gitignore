@@ -10,3 +10,5 @@ pdf_output/
 *_extracted.txt
 compare_output/
 test_images/
+image_output_v2/
+image_output/

@@ -60,6 +60,78 @@ def _is_single_char_with_special_only(token: str) -> bool:
     return True
 
 
+def _next_tamil_grapheme(s: str, start: int) -> tuple[str | None, int]:
+    """Return (one Tamil grapheme substring, next index) or (None, start). One grapheme = one Lo + optional following Tamil marks."""
+    i = start
+    while i < len(s) and s[i].isspace():
+        i += 1
+    if i >= len(s) or not (TAMIL_START <= ord(s[i]) <= TAMIL_END):
+        return None, i
+    if unicodedata.category(s[i]) != "Lo":
+        return None, i
+    j = i + 1
+    while j < len(s) and TAMIL_START <= ord(s[j]) <= TAMIL_END and unicodedata.category(s[j]) != "Lo":
+        j += 1
+    return s[i:j], j
+
+
+def _strip_leading_initials(s: str) -> tuple[str, str]:
+    """Strip leading (single_char + '.')+ from s. Return (stripped_prefix, remainder)."""
+    i = 0
+    prefix_parts: list[str] = []
+    while True:
+        g, j = _next_tamil_grapheme(s, i)
+        if g is None or j >= len(s):
+            break
+        if s[j] != ".":
+            break
+        prefix_parts.append(s[i : j + 1])
+        i = j + 1
+    prefix = "".join(prefix_parts)
+    remainder = s[i:].strip() if s[i:] else s[i:]
+    return prefix, remainder
+
+
+def _is_only_initials_token(token: str) -> bool:
+    """True if token is only (single_char + '.')+ with optional spaces (e.g. உ., வே., உ.வே.)."""
+    _, remainder = _strip_leading_initials(token)
+    return len(remainder) == 0
+
+
+def _step_0_remove_name_initials(line_tokens: list[list[str]]) -> list[list[str]]:
+    """First step: remove name initials. Only full stop (.) after single char; same-line for next token; strip run of initials before name."""
+    out: list[list[str]] = []
+    for line in line_tokens:
+        # (B) Within-token: strip leading initials if remainder is a valid word
+        new_line: list[str] = []
+        for t in line:
+            _, remainder = _strip_leading_initials(t)
+            if remainder and _tamil_grapheme_count(_strip_to_tamil(remainder)) >= 2:
+                new_line.append(remainder)
+            else:
+                new_line.append(t)
+        line = [t for t in new_line if t]
+        # (A) Remove tokens that are only initials when next token (same line) is a valid word; then remove previous initials repeatedly
+        i = 0
+        while i < len(line):
+            if not _is_only_initials_token(line[i]):
+                i += 1
+                continue
+            # This token is only initials; check if next token on same line is valid word
+            if i + 1 >= len(line) or not _is_valid_word(line[i + 1]):
+                i += 1
+                continue
+            # Remove this initial token
+            line.pop(i)
+            # Repeatedly remove previous token if it is also only initials
+            while i > 0 and _is_only_initials_token(line[i - 1]):
+                line.pop(i - 1)
+                i -= 1
+            # do not advance i: next token is now at i
+        out.append(line)
+    return out
+
+
 def _tokenize_lines(content: str) -> list[list[str]]:
     """Split content into lines, then each line into tokens by whitespace. Preserves structure."""
     lines = content.split("\n")
@@ -184,6 +256,7 @@ def _run_pipeline(
 ) -> tuple[str, list[str]]:
     """Run full pipeline on OCR content. Returns (pre_split_text, candidates)."""
     line_tokens = _tokenize_lines(content)
+    line_tokens = _step_0_remove_name_initials(line_tokens)
     line_tokens = _remove_tokens_with_underscore(line_tokens)
     line_tokens = _step_1_1_single_char_only_lines(line_tokens)
     flat = _flatten_tokens_with_line_info(line_tokens)
