@@ -4,7 +4,6 @@ Converts each page to an image, runs OCR, returns combined text.
 """
 import os
 import sys
-import time
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -101,11 +100,6 @@ def get_ocr_per_page(
             os.remove(temp_image)
         except OSError:
             pass
-
-        # Rate limit: 30 s break after every 2 pages (skip after last page)
-        if (page_num + 1) % 2 == 0 and (page_num + 1) < pages:
-            print("Waiting 30 s (rate limit)...", flush=True)
-            time.sleep(30)
 
     pdf.close()
     return page_texts

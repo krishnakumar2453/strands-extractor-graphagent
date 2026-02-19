@@ -22,7 +22,7 @@ TAMIL_OCR_PROMPT = """Extract all Tamil text from this image exactly as it appea
 Strict Rules:
 1. Preserve the EXACT layout, spacing, and line breaks as shown in the image
 2. Keep text in Tamil, do NOT translate
-3. Keep words with dash(_) as it is in the output (for example: த__காளி, சன்_ல்)
+3. Keep words with dash(_) as it is in the output .for both single and multiple dash/undercourse (for example: த__காளி, சன்___ல்)
 4. Ignore headers, footers, and page numbers
 5. Avoid diagrams and tables, only extract readable text
 6. Do NOT add any explanations or formatting markers

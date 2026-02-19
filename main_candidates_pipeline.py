@@ -6,7 +6,6 @@ from strands import Agent
 import json
 import os
 import sys
-import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -268,10 +267,6 @@ if __name__ == "__main__":
                 page_vocabularies.append(data)
             except json.JSONDecodeError:
                 pass
-
-        if page_num % 2 == 0 and page_num < len(pages_ocr):
-            print("Waiting 30 s (rate limit)...", flush=True)
-            time.sleep(30)
 
     # Merge all page vocabularies
     merged = {}
