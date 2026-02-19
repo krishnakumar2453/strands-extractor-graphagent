@@ -44,7 +44,13 @@ def _is_valid_word(token: str) -> bool:
 
 
 def _is_single_char_with_special_only(token: str) -> bool:
-    """True if token is only special chars and single Tamil grapheme(s) (e.g. (இ), [மா ,சி])."""
+    """True if token has special chars (punctuation/symbols) and only single Tamil grapheme(s) (e.g. (இ), [மா ,சி]). Pure Tamil like தை is False so step 1.3 can keep it when adjacent to valid words."""
+    has_special = any(
+        c for c in token
+        if not (c.isspace() or (TAMIL_START <= ord(c) <= TAMIL_END))
+    )
+    if not has_special:
+        return False
     tamil_runs = re.findall(r"[\u0B80-\u0BFF]+", token)
     if not tamil_runs:
         return False
@@ -267,26 +273,31 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 2:
         print(
-            "Usage: python ocr_word_candidates.py <ocr.txt path> [candidates.json] [pre_split.txt]\n"
-            "  pre_split.txt: optional; write OCR string before final split (Tamil + spaces only)."
+            "Usage: python word_candidates.py <ocr.txt path> [candidates.json] [pre_split.txt]\n"
+            "  If no output paths given, saves to <input_stem>_candidates.json and <input_stem>_pre_split.txt\n"
+            "  (input_stem = filename without extension; _full_ocr suffix is stripped if present)."
         )
         sys.exit(1)
-    path = sys.argv[1]
-    out_json = sys.argv[2] if len(sys.argv) > 2 else None
-    out_pre_split = sys.argv[3] if len(sys.argv) > 3 else None
+    path = Path(sys.argv[1])
+    out_json = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    out_pre_split = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    if out_pre_split is not None:
-        pre_split_text, candidates = ocr_path_to_word_candidates_with_insight(path)
-        Path(out_pre_split).write_text(pre_split_text, encoding="utf-8")
+    # Derive base name from input: e.g. test_pdf4_full_ocr -> test_pdf4; myfile -> myfile
+    stem = path.stem
+    if stem.endswith("_full_ocr"):
+        base_name = stem[: -len("_full_ocr")]
     else:
-        candidates = ocr_path_to_word_candidates(path)
+        base_name = stem
+    parent = path.parent
 
+    if out_json is None:
+        out_json = parent / f"{base_name}_candidates.json"
+    if out_pre_split is None:
+        out_pre_split = parent / f"{base_name}_pre_split.txt"
+
+    pre_split_text, candidates = ocr_path_to_word_candidates_with_insight(path)
+    out_pre_split.write_text(pre_split_text, encoding="utf-8")
     json_str = json.dumps(candidates, ensure_ascii=False, indent=0)
-    if out_json:
-        Path(out_json).write_text(json_str, encoding="utf-8")
-    else:
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except AttributeError:
-            pass
-        print(json_str)
+    out_json.write_text(json_str, encoding="utf-8")
+    print(f"Candidates saved to: {out_json}")
+    print(f"Pre-split text saved to: {out_pre_split}")
