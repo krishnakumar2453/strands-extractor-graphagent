@@ -47,6 +47,7 @@ NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to re
 
 Input: "candidates". Output: "filtered_candidates".
 
+
 REMOVE ONLY THESE THREE (when clearly identified):
 1.Meaningless words: non-lexical fragments that are not real dictionary words (e.g. standalone க்கு, ஆல் as fragments; லிளி; nonsensical OCR fragments). Keep real Tamil words even if short. When in doubt, KEEP.
 
@@ -54,9 +55,11 @@ REMOVE ONLY THESE THREE (when clearly identified):
 
 3.Place names: cities, countries, states, regions (e.g. அமெரிக்கா, சென்னை, தமிழ்நாடு, இந்தியா). Keep common nouns (e.g. ஊர், நாடு when used as common words).
 
+Process each candidate one by one from start to end. Apply the same rules to the last word as to the first. Do not miss or drop words in the middle or at the end of the list.
 
 CRITICAL: Do NOT remove any other word. Do NOT miss any word. When in doubt, KEEP the word. Every candidate must appear in filtered_candidates unless it is clearly a person name, place name, or meaningless fragment.
 WORDS IN CANDIDATE_LIST ARE VERY IMPORTANT AND SHOULD NOT BE REMOVED OR MISS WHILE RETURNING.
+
 
 OUTPUT (this exact JSON only):
 {
