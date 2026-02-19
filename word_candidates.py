@@ -294,6 +294,18 @@ def _run_pipeline(
     return (pre_split_text, candidates)
 
 
+def ocr_text_to_word_candidates(
+    content: str,
+    deduplicate: bool = True,
+) -> list[str]:
+    """
+    Run the same filter pipeline on OCR content string; return list of Tamil word candidates.
+    Use when you have OCR text in memory (e.g. per-page) instead of a file path.
+    """
+    _, candidates = _run_pipeline(content, deduplicate)
+    return candidates
+
+
 def ocr_path_to_word_candidates(
     ocr_txt_path: str | Path,
     encoding: str = "utf-8",

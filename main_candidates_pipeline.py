@@ -1,0 +1,292 @@
+# Tamil vocabulary extraction pipeline — word_candidates.py + 3-agent graph
+# Word candidates come from word_candidates.py (no word_candidate / word_candidate_validator agents).
+# Then: noise_filter → root_normalizer → variant_grouping. Same output format as main.py.
+from strands.multiagent import GraphBuilder
+from strands import Agent
+import json
+import os
+import sys
+import time
+from typing import Any
+
+from dotenv import load_dotenv
+from google import genai
+from strands.models.gemini import GeminiModel
+
+load_dotenv()
+
+
+class _GeminiModelNoEmptyTools(GeminiModel):
+    """Omit tools key when no tools, so Gemini API does not reject the request."""
+
+    def _format_request_config(
+        self,
+        tool_specs: list[Any] | None,
+        system_prompt: str | None,
+        params: dict[str, Any] | None,
+    ) -> genai.types.GenerateContentConfig:
+        config_kw: dict[str, Any] = {
+            "system_instruction": system_prompt,
+            **(params or {}),
+        }
+        if tool_specs:
+            formatted_tools = self._format_request_tools(tool_specs)
+            if formatted_tools:
+                config_kw["tools"] = formatted_tools
+        return genai.types.GenerateContentConfig(**config_kw)
+
+
+model = _GeminiModelNoEmptyTools(
+    client_args={"api_key": os.getenv("GEMINI_API_KEY")},
+    model_id="gemini-2.0-flash",
+    params={"temperature": 0},
+)
+
+# --- Prompts (same as main.py: noise_filter, root_normalizer, variant_grouping) ---
+NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to remove three kinds of entries from a list of Tamil word candidates. Do nothing else.
+
+Input: "candidates". Output: "filtered_candidates".
+
+REMOVE ONLY THESE THREE (when clearly identified):
+1.Meaningless words: non-lexical fragments that are not real dictionary words (e.g. standalone க்கு, ஆல் as fragments; லிளி; nonsensical OCR fragments). Keep real Tamil words even if short. When in doubt, KEEP.
+
+2.Person names: first names, surnames, or full names of people (e.g. விஜய், கார்த்திக், கிறிஸ்டோபர், கொலம்பஸ், ஓடா). Keep common words that are not names (e.g. அரசன், மாணவன்).
+
+3.Place names: cities, countries, states, regions (e.g. அமெரிக்கா, சென்னை, தமிழ்நாடு, இந்தியா). Keep common nouns (e.g. ஊர், நாடு when used as common words).
+
+
+CRITICAL: Do NOT remove any other word. Do NOT miss any word. When in doubt, KEEP the word. Every candidate must appear in filtered_candidates unless it is clearly a person name, place name, or meaningless fragment.
+WORDS IN CANDIDATE_LIST ARE VERY IMPORTANT AND SHOULD NOT BE REMOVED OR MISS WHILE RETURNING.
+
+OUTPUT (this exact JSON only):
+{
+  "filtered_candidates": ["word1", "word2", "word3", "..."]
+}
+"""
+
+
+
+ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Convert each Tamil word to its dictionary base/root form.
+ Input: "filtered_candidates". Output: "normalized" list of { "root", "form" }. One word → one root. NEVER delete a word. NEVER merge different meanings.
+
+ 
+ROOT WORD RULES:
+- Strip all grammatical suffixes and return only the base form. Suffixes include: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம் , ஒடு/ஓடு, அது ,வாறு etc,.
+ Root must never be the inflected form (e.g. இவ்வாறாகப் → root இவ்வாறு; பதினெட்டாம் → பதினெட்டு; வகுப்பில் → வகுப்பு; ஓரமாக → ஓரம்; மொழியொடு → மொழி; சிறந்தது → சிறந்த; அறியாதவாறு → அறியாத).
+- NOUNS → singular nominative (e.g. அரசன், மணம், நிறம்).
+- VERBS → verb stem (e.g. செல், பார், இரு).
+- Passive/compound verb forms (e.g. அழைக்கப்படுகிறார், கொண்டிருந்தான் ) → root = verb stem only: strip -க்கப்படு, -யப்பட்டு, -ப்பட்டிருந்தன, -ப்படுகிறார், etc. and return the stem (அழைக்கப்படு, கொண்டிரு).
+- ADJECTIVES → base form (e.g. புதிய).
+- Negative/participial forms (e.g. தோன்றாது) → root must be corresponding negative stem (தோன்றாத), not the positive stem (தோன்று).
+
+IMPORTANT : YOU ARE NOT ALLOWED TO REMOVE ANY WORD FROM THE CANDIDATES LIST. 
+WORDS IN Filtered candidates are very important so do not remove ,miss any entry while returning 
+
+
+OUTPUT (this exact JSON only):
+{
+  "normalized": [
+    { "root": "root_word", "form": "original_form" },
+    ...
+  ]
+}
+ 
+ 
+"""
+
+VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root and output the final vocabulary. Input: "normalized" list. Output: the final vocabulary JSON only (no wrapper key).
+Your task is to group word forms under a single Tamil root ONLY when they share the same meaning.
+
+CRITICAL: ONE root . Merge all grammatical variants. Do not miss any word.
+
+WHEN TO MERGE (same initial spelling, same meaning, different grammar):
+✓ அரசன், அரசர், அரசர்கள் → "அரசன்"
+✓ இரு, இருக்கும், இருப்பது, இருந்தது → "இரு"
+✓ கடை, கடையில், கடைக்கு → "கடை"
+
+WHEN TO KEEP SEPARATE (different meanings):
+✗ பார் (to see) vs பார்வை (vision/sight)
+✗ அரசு (government/kingdom) vs அரசன் (king)
+
+At First the spelling should little bit same and they convey same meaning.
+If two roots feel repetitive or redundant, MERGE them.
+Only keep separate if the meaning difference is significant and useful.
+
+Return ONLY a single JSON object. Keys are Tamil root words. Values are arrays of all surface forms (original forms) for that root.
+
+OUTPUT FORMAT:
+{
+  "root_word": ["original_form_1", "original_form_2"],
+  ...
+}
+"""
+
+# --- Agents (3 only) ---
+noise_filter_agent = Agent(
+    name="noise_filter_agent",
+    model=model,
+    system_prompt=NOISE_FILTER_PROMPT,
+    tools=[],
+)
+root_normalizer_agent = Agent(
+    name="root_normalizer_agent",
+    model=model,
+    system_prompt=ROOT_NORMALIZER_PROMPT,
+    tools=[],
+)
+variant_grouping_agent = Agent(
+    name="variant_grouping_agent",
+    model=model,
+    system_prompt=VARIANT_GROUPING_PROMPT,
+    tools=[],
+)
+
+# --- 3-node graph: noise_filter → root_normalizer → variant_grouping ---
+builder = GraphBuilder()
+builder.add_node(noise_filter_agent, "noise_filter")
+builder.add_node(root_normalizer_agent, "root_normalizer")
+builder.add_node(variant_grouping_agent, "variant_grouping")
+builder.add_edge("noise_filter", "root_normalizer")
+builder.add_edge("root_normalizer", "variant_grouping")
+builder.set_entry_point("noise_filter")
+graph = builder.build()
+
+NODE_ORDER = ["noise_filter", "root_normalizer", "variant_grouping"]
+
+
+def _get_agent_output(node_result):
+    """Extract assistant text from a node's AgentResult."""
+    if node_result is None or node_result.result is None:
+        return ""
+    msg = node_result.result.message
+    if not msg or "content" not in msg:
+        return ""
+    for block in msg.get("content", []):
+        if isinstance(block, dict) and "text" in block and block["text"]:
+            return block["text"].strip()
+    return ""
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path as PathLib
+
+    from word_candidates import ocr_text_to_word_candidates
+
+    parser = argparse.ArgumentParser(
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → root_normalizer → variant_grouping → vocabulary JSON."
+    )
+    parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
+    parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
+    parser.add_argument(
+        "-o", "--output-dir", default="pdf_output", help="Output dir (default: pdf_output)"
+    )
+    parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
+    args = parser.parse_args()
+
+    if not os.getenv("GEMINI_API_KEY"):
+        print("Error: GEMINI_API_KEY is not set. Set it in .env or the environment.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.pdf:
+        from pdf_processor import get_ocr_per_page
+
+        print("Getting OCR from PDF (non-agentic, page by page)...")
+        pages_ocr = get_ocr_per_page(args.pdf, output_dir=args.output_dir, dpi=args.dpi)
+        pdf_name = PathLib(args.pdf).stem
+        combined_path = os.path.join(args.output_dir, f"{pdf_name}_full_ocr.txt")
+        combined = "\n\n".join(f"--- Page {i} ---\n{t}" for i, t in enumerate(pages_ocr, start=1))
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(combined_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+        print(f"✓ OCR saved to: {combined_path}")
+    elif args.image:
+        from ocr import tamil_ocr_from_image
+
+        print("Getting OCR from image (non-agentic)...")
+        pages_ocr = [tamil_ocr_from_image(args.image)]
+    else:
+        parser.error("Input required: use --pdf PATH or --image PATH.")
+
+    input_basename = PathLib(args.pdf).stem if args.pdf else PathLib(args.image).stem
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    header = "\n" + "=" * 60 + " PIPELINE OUTPUTS (word_candidates.py + 3 agents) " + "=" * 60
+    page_vocabularies = []
+    graph_failed = False
+
+    for page_num, page_text in enumerate(pages_ocr, start=1):
+        print(f"Page {page_num}/{len(pages_ocr)}: word_candidates.py → 3-agent graph...")
+        # 1) Candidates from word_candidates.py (no agents)
+        candidates = ocr_text_to_word_candidates(page_text, deduplicate=True)
+        initial_input = json.dumps({"candidates": candidates}, ensure_ascii=False)
+
+        try:
+            result = graph(initial_input)
+        except Exception as e:
+            print(f"Error on page {page_num}: {e}", file=sys.stderr)
+            graph_failed = True
+            break
+
+        pipeline_lines = [header]
+        # Section: word_candidates (from word_candidates.py)
+        word_candidates_block = f"\n--- word_candidates (word_candidates.py) ---\n{initial_input}\n"
+        pipeline_lines.append(word_candidates_block)
+        print(word_candidates_block)
+
+        variant_grouping_json_text = None
+        for node_id in NODE_ORDER:
+            node_result = result.results.get(node_id)
+            text = _get_agent_output(node_result)
+            if text:
+                if text.startswith("```"):
+                    lines = text.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    text = "\n".join(lines)
+                if node_id == "variant_grouping":
+                    variant_grouping_json_text = text
+            block = f"\n--- {node_id} ---\n{text}\n"
+            print(block)
+            pipeline_lines.append(block)
+
+        page_path = os.path.join(
+            args.output_dir, f"{input_basename}_page{page_num}_pipeline_output.txt"
+        )
+        with open(page_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(pipeline_lines))
+        print(f"Pipeline output saved to: {page_path}")
+
+        if variant_grouping_json_text:
+            try:
+                data = json.loads(variant_grouping_json_text)
+                page_vocabularies.append(data)
+            except json.JSONDecodeError:
+                pass
+
+        if page_num % 2 == 0 and page_num < len(pages_ocr):
+            print("Waiting 30 s (rate limit)...", flush=True)
+            time.sleep(30)
+
+    # Merge all page vocabularies
+    merged = {}
+    for vocab in page_vocabularies:
+        if not isinstance(vocab, dict):
+            continue
+        for root, forms in vocab.items():
+            if not isinstance(forms, list):
+                continue
+            merged.setdefault(root, []).extend(forms)
+    for root in merged:
+        merged[root] = list(dict.fromkeys(merged[root]))
+
+    output_json_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary.json")
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    print(f"Final vocabulary (merged, deduped) saved to: {output_json_path}")
+    print(f"Root words count: {len(merged)}")
+
+    if graph_failed:
+        sys.exit(1)
