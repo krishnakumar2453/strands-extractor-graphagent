@@ -1,11 +1,13 @@
 """
 Baseline comparison: run pipeline on test_pdfs/*.pdf and compare outputs to
 testcases/<basename>/root_output.json. Report only missed roots, extra roots,
-and differing form lists.
+and differing form lists. Uses main_candidates_pipeline.py. Optional limit and
+sleep between PDFs to avoid resource exhaustion.
 """
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -22,10 +24,10 @@ def discover_pdfs(pdf_dir: Path) -> list[Path]:
 
 
 def run_pipeline(pdf_path: Path, output_dir: Path) -> bool:
-    """Run main.py on pdf_path, writing to output_dir. Return True on success."""
+    """Run main_candidates_pipeline.py on pdf_path, writing to output_dir. Return True on success."""
     cmd = [
         sys.executable,
-        "main.py",
+        "main_candidates_pipeline.py",
         "--pdf", str(pdf_path.resolve()),
         "-o", str(output_dir.resolve()),
     ]
@@ -92,6 +94,20 @@ def main() -> int:
         metavar="BASENAME",
         help="Compare only this PDF (basename, e.g. test_pdf1). File must be in --pdf-dir. Omit to compare all PDFs.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Process only the first N PDFs (default: 10). Ignored if --pdf is set.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=45,
+        metavar="SECS",
+        help="Seconds to sleep after each PDF to avoid resource exhaustion (default: 45).",
+    )
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parent
     pdf_dir = (args.pdf_dir if args.pdf_dir.is_absolute() else repo_root / args.pdf_dir)
@@ -107,6 +123,8 @@ def main() -> int:
         if not pdfs:
             print(f"No PDF found with basename '{args.pdf}' in {pdf_dir}. Use the filename without .pdf (e.g. test_pdf1).", file=sys.stderr)
             return 1
+    else:
+        pdfs = pdfs[: args.limit]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     any_fail = False
@@ -161,6 +179,10 @@ def main() -> int:
             print(f"  (failed to save diff: {e})", file=sys.stderr)
         if missed_roots or different:
             any_fail = True
+
+        if args.sleep > 0 and pdf_path != pdfs[-1]:
+            print(f"[{basename}] Sleeping {args.sleep}s before next PDF...", flush=True)
+            time.sleep(args.sleep)
 
     if any_skip:
         print("Some PDFs skipped (no baseline). Add baselines with save_baseline.py.", file=sys.stderr)
