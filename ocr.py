@@ -27,6 +27,7 @@ Strict Rules:
 5. Avoid diagrams and tables, only extract readable text
 6. Do NOT add any explanations or formatting markers
 7. Output ONLY the extracted Tamil text, nothing else
+8. Do not skip or ignore any section and any text in the image.
 
 Just output the raw Tamil text exactly as it appears on the page."""
 

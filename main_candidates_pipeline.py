@@ -44,14 +44,15 @@ Strip an ending ONLY when BOTH are true:
 
 DO NOT STRIP when the remainder would not be a real word. Example: மகள் (daughter) → root must be மகள். The ending கள் here is part of the word; if you strip it you get ம, which is not a word. So NEVER output ம for மகள்.
 
-Grammatical suffixes (strip only when the stem is a real word): கள் (plural), ஐ (accusative), இல் (locative), க்கு (dative), ஆல் (instrumental), உடன் (with), என்று (that/saying), ஆக (as), ஆம் (affirmative), ஒடு/ஓடு (with), அது (that), வாறு (manner); word-final sandhi ச், ப், த் when they are suffix markers (e.g. before இல், ஆல்). Also: ற்றுள், களுள் when clearly locative/plural suffix.
+Grammatical suffixes (strip only when the stem is a real word): கள் (plural), ஐ (accusative), இல் (locative), க்கு (dative), ஆல் (instrumental), உடன் (with), என்று (that/saying), ஆக (as), ஆம் (affirmative), ஒடு/ஓடு (with), அது (that), வாறு (manner); 
+word-final sandhi ச், ப், த் when they are suffix markers (e.g. before இல், ஆல்). Also: ற்றுள், களுள் when clearly locative/plural suffix.
 
 EXAMPLES:
 - அரசர்கள் → அரசன் (கள் is plural; அரசன் is dictionary word).
-- வகுப்பில் → வகுப்பு (இல் is locative).
+- வகுப்பில் → வகுப்பு (இல் is grammatical suffix).
 - மகள் → மகள் (do NOT strip; ம is not a word).
 - நிலங்கள் → நிலம் (கள் is plural; நிலம் is word).
-- மொழியொடு → மொழி (ஒடு is "with").
+- மொழியொடு → மொழி (ஒடு is grammatical suffix).
 
 CRITICAL — NOT A SINGLE WORD MUST BE MISSED: Words are very important. You must return exactly one pair per input word. Total number of "form" values in your output MUST equal the number of input words. Every input word must appear exactly once as "form". Do not drop, merge, or add any form. Count input words and count output "form" entries; they must be equal.
 
@@ -242,7 +243,8 @@ OUTPUT FORMAT:
 {"root_word": ["form1", "form2", ...], ...}
 """
 
-VARIANT_GROUPING_VALIDATION_PROMPT = """### ROLE
+VARIANT_GROUPING_VALIDATION_PROMPT = """
+### ROLE
 You are the Variant Grouping Validation Agent. Your purpose is to normalize a Tamil vocabulary JSON by merging redundant roots and ensuring all keys are canonical dictionary forms.
 
 ### INPUT SPECIFICATION
@@ -261,6 +263,9 @@ A JSON object where:
 ### OUTPUT FORMAT
 - Return ONLY a valid JSON object. No conversational text, no explanations.
 - Structure: {"root_word": ["form1", "form2", ...], ...}
+
+### CRITICAL — NO FORM MAY BE MISSING: Every "form" in the input normalized list MUST appear in exactly one root's array. The union of all value arrays must equal the set of all "form" strings from the input. Do not omit any original form.
+
 """
 
 # --- Agents (4): noise_filter → root_normalizer (with tool) → variant_grouping → variant_grouping_validation ---
@@ -336,6 +341,7 @@ def _get_agent_output(node_result):
 
 if __name__ == "__main__":
     import argparse
+    import time
     from pathlib import Path as PathLib
 
     from word_candidates import ocr_text_to_word_candidates
@@ -349,6 +355,13 @@ if __name__ == "__main__":
         "-o", "--output-dir", default="pdf_output", help="Output dir (default: pdf_output)"
     )
     parser.add_argument("--dpi", type=int, default=300, help="DPI for PDF pages (default: 300)")
+    parser.add_argument(
+        "--page-sleep",
+        type=float,
+        default=30,
+        metavar="SECS",
+        help="Seconds to pause after each page to avoid rate limits (default: 30). Set to 0 to disable.",
+    )
     args = parser.parse_args()
 
     if not os.getenv("GEMINI_API_KEY"):
@@ -444,6 +457,10 @@ if __name__ == "__main__":
                 page_vocabularies.append(data)
             except json.JSONDecodeError:
                 pass
+
+        if args.page_sleep > 0 and page_num < len(pages_ocr):
+            print(f"Pausing {args.page_sleep}s before next page (rate limit)...", flush=True)
+            time.sleep(args.page_sleep)
 
     # Merge all page vocabularies (before validation)
     before_merged = {}

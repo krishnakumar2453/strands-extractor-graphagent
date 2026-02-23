@@ -23,7 +23,7 @@ def discover_pdfs(pdf_dir: Path) -> list[Path]:
     return sorted(pdf_dir.glob("*.pdf"))
 
 
-def run_pipeline(pdf_path: Path, output_dir: Path) -> bool:
+def run_pipeline(pdf_path: Path, output_dir: Path, page_sleep: float | None = None) -> bool:
     """Run main_candidates_pipeline.py on pdf_path, writing to output_dir. Return True on success."""
     cmd = [
         sys.executable,
@@ -31,6 +31,8 @@ def run_pipeline(pdf_path: Path, output_dir: Path) -> bool:
         "--pdf", str(pdf_path.resolve()),
         "-o", str(output_dir.resolve()),
     ]
+    if page_sleep is not None:
+        cmd.extend(["--page-sleep", str(page_sleep)])
     result = subprocess.run(cmd, cwd=Path(__file__).resolve().parent)
     return result.returncode == 0
 
@@ -108,6 +110,13 @@ def main() -> int:
         metavar="SECS",
         help="Seconds to sleep after each PDF to avoid resource exhaustion (default: 45).",
     )
+    parser.add_argument(
+        "--page-sleep",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help="Seconds to pause after each page (passed to pipeline). Default: use pipeline default (30). Use 0 to disable.",
+    )
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parent
     pdf_dir = (args.pdf_dir if args.pdf_dir.is_absolute() else repo_root / args.pdf_dir)
@@ -140,7 +149,7 @@ def main() -> int:
             continue
 
         print(f"[{basename}] Running pipeline...", flush=True)
-        if not run_pipeline(pdf_path, output_dir):
+        if not run_pipeline(pdf_path, output_dir, page_sleep=args.page_sleep):
             print(f"[{basename}] FAIL: pipeline exited non-zero", file=sys.stderr)
             any_fail = True
             continue
