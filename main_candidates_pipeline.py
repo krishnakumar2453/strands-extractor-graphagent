@@ -242,7 +242,28 @@ OUTPUT FORMAT:
 {"root_word": ["form1", "form2", ...], ...}
 """
 
-# --- Agents (3): noise_filter → root_normalizer (with tool) → variant_grouping ---
+VARIANT_GROUPING_VALIDATION_PROMPT = """### ROLE
+You are the Variant Grouping Validation Agent. Your purpose is to normalize a Tamil vocabulary JSON by merging redundant roots and ensuring all keys are canonical dictionary forms.
+
+### INPUT SPECIFICATION
+A JSON object where:
+- Keys = Potential Tamil roots (may contain errors or inflections).
+- Values = Arrays of surface forms (strings).
+
+### STRICT TASK RULES
+1. Root Normalization (De-inflection): Every key MUST be a proper Tamil dictionary root.
+   - Remove grammatical suffixes from keys (e.g., Change "வகுப்பில்" to "வகுப்பு", "சொல்லுதல்" to "சொல்லு").
+   - Do not strip a suffix if the remainder would not be a valid word (e.g. keep மகள் as மகள்).
+2. Deduplication & Merging: If two keys represent the same semantic root (e.g., "சொல்லு" and "சொல்"), merge them into a single canonical key. When merging, combine all surface forms from both original keys into one array.
+3. Data Integrity (Zero-Loss Policy): Do not drop any surface forms from the input arrays. Do not invent or add new surface forms. Ensure surface forms are unique within their final array (remove duplicates).
+4. Semantic Distinction: Do NOT merge words that look similar but have different meanings (e.g., "அண்ணன்" (brother) and "அன்னம்" (swan/food) must remain separate).
+
+### OUTPUT FORMAT
+- Return ONLY a valid JSON object. No conversational text, no explanations.
+- Structure: {"root_word": ["form1", "form2", ...], ...}
+"""
+
+# --- Agents (4): noise_filter → root_normalizer (with tool) → variant_grouping → variant_grouping_validation ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
@@ -261,159 +282,43 @@ variant_grouping_agent = Agent(
     system_prompt=VARIANT_GROUPING_PROMPT,
     tools=[],
 )
+variant_grouping_validation_agent = Agent(
+    name="variant_grouping_validation_agent",
+    model=model,
+    system_prompt=VARIANT_GROUPING_VALIDATION_PROMPT,
+    tools=[],
+)
 
 builder = GraphBuilder()
 builder.add_node(noise_filter_agent, "noise_filter")
 builder.add_node(root_normalizer_agent, "root_normalizer")
 builder.add_node(variant_grouping_agent, "variant_grouping")
+builder.add_node(variant_grouping_validation_agent, "variant_grouping_validation")
 builder.add_edge("noise_filter", "root_normalizer")
 builder.add_edge("root_normalizer", "variant_grouping")
+builder.add_edge("variant_grouping", "variant_grouping_validation")
 builder.set_entry_point("noise_filter")
 graph = builder.build()
 
-NODE_ORDER = ["noise_filter", "root_normalizer", "variant_grouping"]
+NODE_ORDER = ["noise_filter", "root_normalizer", "variant_grouping", "variant_grouping_validation"]
 
 
-# --- Tamil letter (akshara) segmentation for variant-merge grouping ---
-# Tamil Unicode: vowels 0B85-0B94, consonants 0B95-0BB9, virama 0BCD, vowel signs 0BBE-0BCC
-_TAMIL_VIRAMA = "\u0BCD"
-_TAMIL_VOWEL_SIGNS = (
-    "\u0BBE\u0BBF\u0BC0\u0BC1\u0BC2\u0BC6\u0BC7\u0BC8\u0BCA\u0BCB\u0BCC"
-)
-
-
-def _tamil_letters(s: str) -> list[str]:
-    """Segment Tamil string into letters (aksharas). Returns list of letter substrings."""
-    if not s:
-        return []
-    letters = []
-    i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        # Tamil independent vowel (0B85-0B94)
-        if "\u0B85" <= c <= "\u0B94":
-            letters.append(c)
-            i += 1
+def _recover_missing_roots(before_vocab: dict, after_vocab: dict) -> list[tuple[str, list[str]]]:
+    """Add roots from before_vocab whose forms are missing in after_vocab. Mutates after_vocab. Returns list of (root, forms) added."""
+    forms_after = set()
+    for forms in after_vocab.values():
+        if isinstance(forms, list):
+            forms_after.update(forms)
+    added = []
+    for root, forms in before_vocab.items():
+        if root in after_vocab:
             continue
-        # Tamil consonant (0B95-0B99, 0B9A-0B9C, 0B9E, 0B9F-0BA3, 0BA8, 0BAA-0BB0, 0BB2-0BB9)
-        if (
-            "\u0B95" <= c <= "\u0B99"
-            or "\u0B9A" <= c <= "\u0B9C"
-            or c == "\u0B9E"
-            or "\u0B9F" <= c <= "\u0BA3"
-            or c == "\u0BA8"
-            or "\u0BAA" <= c <= "\u0BB0"
-            or "\u0BB2" <= c <= "\u0BB9"
-        ):
-            start = i
-            i += 1
-            if i < n and s[i] == _TAMIL_VIRAMA:
-                i += 1  # consonant + virama = one letter (dead consonant)
-            elif i < n and s[i] in _TAMIL_VOWEL_SIGNS:
-                i += 1  # consonant + vowel sign = one letter
-            letters.append(s[start:i])
-            continue
-        # Non-Tamil or other: treat as one "letter" so we don't break
-        letters.append(c)
-        i += 1
-    return letters
-
-
-def _tamil_letter_count(s: str) -> int:
-    """Return number of Tamil letters (aksharas) in s."""
-    return len(_tamil_letters(s))
-
-
-def _tamil_prefix(s: str, n_letters: int) -> str:
-    """Return prefix of s consisting of first n_letters Tamil letters."""
-    letters = _tamil_letters(s)
-    return "".join(letters[:n_letters]) if n_letters else ""
-
-
-def _group_key_for_root(root: str) -> str:
-    """Prefix key for grouping: by letter count, take first 1/2/3 letters."""
-    n = _tamil_letter_count(root)
-    if n <= 2:
-        take = 1
-    elif n == 3:
-        take = 2
-    else:
-        take = 3
-    return _tamil_prefix(root, take)
-
-
-# --- Variant-merge validation (post-pipeline): merge same-meaning roots ---
-VARIANT_MERGE_SYSTEM = """You are given a list of Tamil roots that share the same starting letters. Each root has its "forms" (original surface forms).
-
-scenario : we already assign a task to covert the words to root form. But I doubt the system may be miss to convert them into root form, especially I doubt these words.
-you are assigned to find root word for both and if they match keep them under one root otherwise keep them separate.
-
-For each group: deside whether these roots have the same meaning or different meanings.
-
-- If SAME meaning: return ONE root (the correct dictionary/canonical form) and combine ALL forms from all roots under that one root.
- Example: சொல்லு and சொல்லுதல்  → canonical root "சொல்லு", forms ["சொல்லுங்கள்", "சொல்லுதல்"].
-- If DIFFERENT meanings: return each root unchanged with its own forms.
- Example: அண்ணன் (brother) vs அன்னம் (swan) → different.
-
-CRITICAL: Do not drop any form. Total forms in output must equal total forms in input. If merging, use the more standard/canonical root (e.g. verb stem rather than verbal noun form when they mean the same).
-
-Return ONLY valid JSON in this exact shape (no other text):
-{"roots_with_forms": [{"root": "root_word", "forms": ["form1", "form2", ...]}, ...]}"""
-
-
-def _variant_merge_call_llm(roots_with_forms: list[dict]) -> list[dict]:
-    """Call LLM to resolve one doubt group. Returns list of {root, forms} (subset output)."""
-    payload = {"roots_with_forms": roots_with_forms}
-    user_content = json.dumps(payload, ensure_ascii=False)
-    out = _call_llm_json(VARIANT_MERGE_SYSTEM, user_content)
-    try:
-        data = json.loads(out)
-        items = data.get("roots_with_forms", data) if isinstance(data, dict) else data
-        if isinstance(items, list) and items:
-            return items
-    except json.JSONDecodeError:
-        pass
-    return roots_with_forms  # fallback: no change
-
-
-def validate_and_merge_duplicate_roots(vocab: dict[str, list[str]]) -> dict[str, list[str]]:
-    """Post-pipeline step: group roots by Tamil letter prefix, ask LLM for doubt groups, merge same meaning. Returns new vocabulary (no forms dropped)."""
-    if not vocab:
-        return vocab
-    # Group roots by prefix (by letter count)
-    groups: dict[str, list[str]] = {}
-    for root in vocab:
-        key = _group_key_for_root(root)
-        groups.setdefault(key, []).append(root)
-    # Only groups with at least 2 roots
-    result = dict(vocab)
-    for key, roots in groups.items():
-        if len(roots) < 2:
-            continue
-        roots_with_forms = [
-            {"root": r, "forms": list(result[r])} for r in roots
-        ]
-        resolved = _variant_merge_call_llm(roots_with_forms)
-        # Remove old roots for this group
-        for r in roots:
-            result.pop(r, None)
-        # Add resolved roots (merge may combine into one or keep separate)
-        for item in resolved:
-            if not isinstance(item, dict) or "root" not in item:
-                continue
-            r = item["root"]
-            forms = item.get("forms", [])
-            if not isinstance(forms, list):
-                forms = [forms] if forms else []
-            result.setdefault(r, []).extend(forms)
-        # Dedupe form lists for roots we just added
-        for item in resolved:
-            if isinstance(item, dict) and "root" in item:
-                r = item["root"]
-                if r in result:
-                    result[r] = list(dict.fromkeys(result[r]))
-    return result
+        if not isinstance(forms, list):
+            forms = [forms] if forms else []
+        if any(f not in forms_after for f in forms):
+            after_vocab[root] = list(dict.fromkeys(forms))
+            added.append((root, forms))
+    return added
 
 
 def _get_agent_output(node_result):
@@ -475,6 +380,8 @@ if __name__ == "__main__":
 
     header = "\n" + "=" * 60 + " PIPELINE OUTPUTS (word_candidates.py + 3 agents, root_normalizer with tool) " + "=" * 60
     page_vocabularies = []
+    page_vocabularies_before_validation = []
+    page_output_paths = []
     graph_failed = False
 
     for page_num, page_text in enumerate(pages_ocr, start=1):
@@ -497,6 +404,7 @@ if __name__ == "__main__":
         print(word_candidates_block)
 
         variant_grouping_json_text = None
+        variant_grouping_before_validation_text = None
         for node_id in NODE_ORDER:
             node_result = result.results.get(node_id)
             text = _get_agent_output(node_result)
@@ -509,6 +417,8 @@ if __name__ == "__main__":
                         lines = lines[:-1]
                     text = "\n".join(lines)
                 if node_id == "variant_grouping":
+                    variant_grouping_before_validation_text = text
+                if node_id == "variant_grouping_validation":
                     variant_grouping_json_text = text
             block = f"\n--- {node_id} ---\n{text}\n"
             print(block)
@@ -519,8 +429,15 @@ if __name__ == "__main__":
         )
         with open(page_path, "w", encoding="utf-8") as f:
             f.write("\n".join(pipeline_lines))
+        page_output_paths.append(page_path)
         print(f"Pipeline output saved to: {page_path}")
 
+        if variant_grouping_before_validation_text:
+            try:
+                data = json.loads(variant_grouping_before_validation_text)
+                page_vocabularies_before_validation.append(data)
+            except json.JSONDecodeError:
+                pass
         if variant_grouping_json_text:
             try:
                 data = json.loads(variant_grouping_json_text)
@@ -528,7 +445,19 @@ if __name__ == "__main__":
             except json.JSONDecodeError:
                 pass
 
-    # Merge all page vocabularies
+    # Merge all page vocabularies (before validation)
+    before_merged = {}
+    for vocab in page_vocabularies_before_validation:
+        if not isinstance(vocab, dict):
+            continue
+        for root, forms in vocab.items():
+            if not isinstance(forms, list):
+                continue
+            before_merged.setdefault(root, []).extend(forms)
+    for root in before_merged:
+        before_merged[root] = list(dict.fromkeys(before_merged[root]))
+
+    # Merge all page vocabularies (after validation)
     merged = {}
     for vocab in page_vocabularies:
         if not isinstance(vocab, dict):
@@ -540,29 +469,79 @@ if __name__ == "__main__":
     for root in merged:
         merged[root] = list(dict.fromkeys(merged[root]))
 
-    # Save old vocabulary (before variant-merge)
-    old_vocab_path = os.path.join(args.output_dir, f"{input_basename}_old_vocabulary.json")
-    with open(old_vocab_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    print(f"Old vocabulary (before variant-merge) saved to: {old_vocab_path}")
-    print(f"Old root count: {len(merged)}")
+    # Save before-validation vocabulary
+    before_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary_before_validation.json")
+    with open(before_path, "w", encoding="utf-8") as f:
+        json.dump(before_merged, f, ensure_ascii=False, indent=2)
+    print(f"Vocabulary (before validation) saved to: {before_path}")
+    print(f"Root count before validation: {len(before_merged)}")
 
-    # Post-pipeline: merge same-meaning roots (doubt groups by Tamil letter prefix)
-    print("Running variant-merge validation (doubt groups by Tamil letter prefix)...")
-    merged = validate_and_merge_duplicate_roots(merged)
-
-    # Save final merged vocabulary (after variant-merge)
-    final_merged_path = os.path.join(args.output_dir, f"{input_basename}_final_merged_vocabulary.json")
-    with open(final_merged_path, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-    print(f"Final merged vocabulary (after variant-merge) saved to: {final_merged_path}")
-    print(f"Final root count: {len(merged)}")
-
-    # Also write to vocabulary.json for backward compatibility
+    # Save after-validation vocabulary (before recovery)
     output_json_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
-    print(f"Vocabulary (same as final) also saved to: {output_json_path}")
+    print(f"Vocabulary (after validation) saved to: {output_json_path}")
+    print(f"Root count after validation: {len(merged)}")
+
+    # Recover missing roots: add any root from before_merged whose forms are not in merged
+    recovered = _recover_missing_roots(before_merged, merged)
+    if recovered:
+        for root, forms in recovered:
+            print(f"Recovered root: {root} with forms: {forms}")
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        print(f"Vocabulary (after recovery) saved to: {output_json_path} ({len(recovered)} root(s) recovered).")
+    print(f"Final root count: {len(merged)}")
+
+    # Append recovered vocabulary after variant_grouping_validation in each page pipeline output .txt
+    recovered_block = "\n--- recovered vocabulary ---\n" + json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
+    for page_path in page_output_paths:
+        with open(page_path, "a", encoding="utf-8") as f:
+            f.write(recovered_block)
+    if page_output_paths:
+        print(f"Recovered vocabulary appended to {len(page_output_paths)} page pipeline output file(s).")
+
+    # Diff: before vs after validation
+    diff_path = os.path.join(args.output_dir, f"{input_basename}_validation_diff.txt")
+    diff_lines = [
+        "=== Diff: Before vs After variant_grouping_validation_agent ===",
+        f"Before: {len(before_merged)} roots",
+        f"After:  {len(merged)} roots",
+        "",
+    ]
+    before_roots = set(before_merged)
+    after_roots = set(merged)
+    only_before = sorted(before_roots - after_roots)
+    only_after = sorted(after_roots - before_roots)
+    common = sorted(before_roots & after_roots)
+    if only_before:
+        diff_lines.append("--- Roots only in BEFORE (removed or merged away) ---")
+        for r in only_before:
+            diff_lines.append(f"  {r}: {before_merged[r]}")
+        diff_lines.append("")
+    if only_after:
+        diff_lines.append("--- Roots only in AFTER (new or result of merge) ---")
+        for r in only_after:
+            diff_lines.append(f"  {r}: {merged[r]}")
+        diff_lines.append("")
+    changed = []
+    for r in common:
+        bf = set(before_merged[r])
+        af = set(merged[r])
+        if bf != af:
+            changed.append((r, before_merged[r], merged[r]))
+    if changed:
+        diff_lines.append("--- Roots in both, form list changed ---")
+        for r, bf, af in changed:
+            diff_lines.append(f"  {r}:")
+            diff_lines.append(f"    before: {bf}")
+            diff_lines.append(f"    after:  {af}")
+        diff_lines.append("")
+    if not only_before and not only_after and not changed:
+        diff_lines.append("(No differences between before and after.)")
+    with open(diff_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(diff_lines))
+    print(f"Validation diff saved to: {diff_path}")
 
     if graph_failed:
         sys.exit(1)
