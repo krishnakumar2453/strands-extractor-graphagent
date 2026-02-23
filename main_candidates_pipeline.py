@@ -486,79 +486,20 @@ if __name__ == "__main__":
     for root in merged:
         merged[root] = list(dict.fromkeys(merged[root]))
 
-    # Save before-validation vocabulary
-    before_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary_before_validation.json")
-    with open(before_path, "w", encoding="utf-8") as f:
-        json.dump(before_merged, f, ensure_ascii=False, indent=2)
-    print(f"Vocabulary (before validation) saved to: {before_path}")
-    print(f"Root count before validation: {len(before_merged)}")
-
-    # Save after-validation vocabulary (before recovery)
     output_json_path = os.path.join(args.output_dir, f"{input_basename}_vocabulary.json")
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
-    print(f"Vocabulary (after validation) saved to: {output_json_path}")
-    print(f"Root count after validation: {len(merged)}")
 
-    # Recover missing roots: add any root from before_merged whose forms are not in merged
     recovered = _recover_missing_roots(before_merged, merged)
     if recovered:
         for root, forms in recovered:
             print(f"Recovered root: {root} with forms: {forms}")
         with open(output_json_path, "w", encoding="utf-8") as f:
             json.dump(merged, f, ensure_ascii=False, indent=2)
-        print(f"Vocabulary (after recovery) saved to: {output_json_path} ({len(recovered)} root(s) recovered).")
+        print(f"Vocabulary saved to: {output_json_path} ({len(recovered)} root(s) recovered).")
+    else:
+        print(f"Vocabulary saved to: {output_json_path}")
     print(f"Final root count: {len(merged)}")
-
-    # Append recovered vocabulary after variant_grouping_validation in each page pipeline output .txt
-    recovered_block = "\n--- recovered vocabulary ---\n" + json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
-    for page_path in page_output_paths:
-        with open(page_path, "a", encoding="utf-8") as f:
-            f.write(recovered_block)
-    if page_output_paths:
-        print(f"Recovered vocabulary appended to {len(page_output_paths)} page pipeline output file(s).")
-
-    # Diff: before vs after validation
-    diff_path = os.path.join(args.output_dir, f"{input_basename}_validation_diff.txt")
-    diff_lines = [
-        "=== Diff: Before vs After variant_grouping_validation_agent ===",
-        f"Before: {len(before_merged)} roots",
-        f"After:  {len(merged)} roots",
-        "",
-    ]
-    before_roots = set(before_merged)
-    after_roots = set(merged)
-    only_before = sorted(before_roots - after_roots)
-    only_after = sorted(after_roots - before_roots)
-    common = sorted(before_roots & after_roots)
-    if only_before:
-        diff_lines.append("--- Roots only in BEFORE (removed or merged away) ---")
-        for r in only_before:
-            diff_lines.append(f"  {r}: {before_merged[r]}")
-        diff_lines.append("")
-    if only_after:
-        diff_lines.append("--- Roots only in AFTER (new or result of merge) ---")
-        for r in only_after:
-            diff_lines.append(f"  {r}: {merged[r]}")
-        diff_lines.append("")
-    changed = []
-    for r in common:
-        bf = set(before_merged[r])
-        af = set(merged[r])
-        if bf != af:
-            changed.append((r, before_merged[r], merged[r]))
-    if changed:
-        diff_lines.append("--- Roots in both, form list changed ---")
-        for r, bf, af in changed:
-            diff_lines.append(f"  {r}:")
-            diff_lines.append(f"    before: {bf}")
-            diff_lines.append(f"    after:  {af}")
-        diff_lines.append("")
-    if not only_before and not only_after and not changed:
-        diff_lines.append("(No differences between before and after.)")
-    with open(diff_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(diff_lines))
-    print(f"Validation diff saved to: {diff_path}")
 
     if graph_failed:
         sys.exit(1)
