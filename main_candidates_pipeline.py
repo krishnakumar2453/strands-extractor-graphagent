@@ -1,6 +1,6 @@
-# Tamil vocabulary extraction pipeline — word_candidates.py + 3-agent graph
-# Word candidates from word_candidates.py. Then: noise_filter → root_normalizer (3 tools) → variant_grouping.
-# Root normalizer: tool1 normalize_to_root → tool2 validate_root_forms → if needs_fix, tool3 fix_roots_in_list.
+# Tamil vocabulary extraction pipeline — word_candidates.py + 4-agent graph
+# Word candidates from word_candidates.py. Then: noise_filter → root_normalizer (2 tools) → variant_grouping → variant_grouping_validation.
+# Root normalizer: tool1 normalize_and_validate (returns normalized + validation in one call) → if needs_fix, tool2 fix_roots_in_list.
 from strands.multiagent import GraphBuilder
 from strands import Agent, tool
 import json
@@ -34,7 +34,7 @@ def _call_llm_json(system: str, user_content: str) -> str:
     return (response.text or "").strip() or "{}"
 
 
-# --- Tool 1: normalize_to_root — remove suffixes and normalize to Tamil dictionary root form ---
+# --- Tool 1: normalize_and_validate — normalize (LLM 1) + validate (LLM 2), return both ---
 NORMALIZE_SYSTEM = """You convert Tamil words to their dictionary base/root form. Output one {"root", "form"} pair per input word.
 
 RULE — WHEN TO STRIP A SUFFIX:
@@ -59,32 +59,52 @@ OUTPUT (this exact JSON only):
 {"normalized": [{"root": "root_word", "form": "original_form"}, ...]}
 Return ONLY valid JSON, no other text."""
 
+# --- Tool 1: normalize_and_validate — normalize to root (LLM call 1) then validate (LLM call 2), return both ---
 @tool
-def normalize_to_root(words: list[str]) -> dict[str, Any]:
-    """Remove grammatical suffixes and normalize all words to Tamil dictionary root form.
+def normalize_and_validate(words: list[str]) -> dict[str, Any]:
+    """Normalize Tamil words to dictionary root form, then validate those roots. Returns both the normalized list and the validation result in one response.
 
     Args:
         words: List of Tamil words (e.g. filtered_candidates from noise_filter).
 
     Returns:
-        Tool result with "normalized": [{"root": "...", "form": "..."}, ...].
+        Tool result with "normalized": [{"root": "...", "form": "..."}, ...] and "validation": either {"status": "all_correct", "message": "..."} or {"status": "needs_fix", "roots_to_fix": ["...", ...]}.
     """
     if not words:
-        return {"status": "success", "content": [{"text": json.dumps({"normalized": []}, ensure_ascii=False)}]}
-    user_content = "Normalize these Tamil words to root form. Return JSON with key \"normalized\" and a list of {\"root\", \"form\"} pairs.\nInput words:\n" + json.dumps(
+        result = {
+            "normalized": [],
+            "validation": {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"},
+        }
+        return {"status": "success", "content": [{"text": json.dumps(result, ensure_ascii=False)}]}
+    # First LLM call: normalize
+    user_norm = "Normalize these Tamil words to root form. Return JSON with key \"normalized\" and a list of {\"root\", \"form\"} pairs.\nInput words:\n" + json.dumps(
         words, ensure_ascii=False
     )
-    out = _call_llm_json(NORMALIZE_SYSTEM, user_content)
+    out_norm = _call_llm_json(NORMALIZE_SYSTEM, user_norm)
     try:
-        data = json.loads(out)
-        if "normalized" not in data:
-            data = {"normalized": data} if isinstance(data, list) else {"normalized": []}
+        norm_data = json.loads(out_norm)
+        if "normalized" not in norm_data:
+            norm_data = {"normalized": norm_data} if isinstance(norm_data, list) else {"normalized": []}
+        normalized_list = norm_data.get("normalized", [])
     except json.JSONDecodeError:
-        data = {"normalized": [], "raw": out[:500]}
-    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
+        normalized_list = []
+    # Second LLM call: validate the normalized list
+    if not normalized_list:
+        validation = {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}
+    else:
+        user_val = "Validate these pairs. Is each \"root\" in dictionary base form (no grammatical suffix)?\n" + json.dumps(
+            {"normalized": normalized_list}, ensure_ascii=False
+        )
+        out_val = _call_llm_json(VALIDATE_SYSTEM, user_val)
+        try:
+            validation = json.loads(out_val)
+        except json.JSONDecodeError:
+            validation = {"status": "needs_fix", "roots_to_fix": []}
+    result = {"normalized": normalized_list, "validation": validation}
+    return {"status": "success", "content": [{"text": json.dumps(result, ensure_ascii=False)}]}
 
 
-# --- Tool 2: validate_root_forms — check if all roots are in correct dictionary form ---
+# --- Validate system prompt (used inside normalize_and_validate) ---
 VALIDATE_SYSTEM = """You validate a list of Tamil root/form pairs. For each pair, check if "root" is in correct dictionary root form (no grammatical suffix left on the root).
 
 RULE — WHEN IS A ROOT CORRECT:
@@ -99,31 +119,7 @@ If ANY root still has a grammatical suffix (and stripping it would leave a valid
 List only the root strings that need correction. Return ONLY valid JSON, no other text."""
 
 
-@tool
-def validate_root_forms(normalized: list[dict]) -> dict[str, Any]:
-    """Validate whether all roots in the normalized list are in correct dictionary root form (no grammatical suffixes).
-
-    Args:
-        normalized: List of {"root": "...", "form": "..."} from normalize_to_root.
-
-    Returns:
-        If all correct: {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}.
-        If some need fixing: {"status": "needs_fix", "roots_to_fix": ["root_a", "root_b", ...]}.
-    """
-    if not normalized:
-        return {"status": "success", "content": [{"text": json.dumps({"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}, ensure_ascii=False)}]}
-    user_content = "Validate these pairs. Is each \"root\" in dictionary base form (no grammatical suffix)?\n" + json.dumps(
-        {"normalized": normalized}, ensure_ascii=False
-    )
-    out = _call_llm_json(VALIDATE_SYSTEM, user_content)
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        data = {"status": "needs_fix", "roots_to_fix": []}
-    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
-
-
-# --- Tool 3: fix_roots_in_list — correct specified roots in the normalized list ---
+# --- Tool 2: fix_roots_in_list — correct specified roots in the normalized list ---
 FIX_ROOTS_SYSTEM = """You correct only the roots listed in roots_to_fix. For each pair whose "root" is in roots_to_fix, replace "root" with the correct dictionary base form. Leave all other pairs unchanged.
 
 STRIP ONLY grammatical suffixes, and ONLY when the remainder is a valid Tamil dictionary word. Do NOT strip when the ending is part of the word (e.g. மகள் stays மகள்; never output ம for மகள்). Suffixes: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம், ஒடு, ஓடு, அது, வாறு; sandhi ச், ப், த் when suffix; ற்றுள், களுள் when suffix.
@@ -140,8 +136,8 @@ def fix_roots_in_list(normalized: list[dict], roots_to_fix: list[str]) -> dict[s
     """Correct the specified roots in the normalized list to proper dictionary root form.
 
     Args:
-        normalized: Full list of {"root": "...", "form": "..."} from normalize_to_root.
-        roots_to_fix: List of root strings that are still inflected (from validate_root_forms).
+        normalized: Full list of {"root": "...", "form": "..."} from normalize_and_validate.
+        roots_to_fix: List of root strings that are still inflected (from validation in normalize_and_validate).
 
     Returns:
         Tool result with corrected "normalized" list (same length, all forms preserved).
@@ -214,14 +210,23 @@ OUTPUT (this exact JSON only):
 
 
 
-# Root normalizer: tool1 → tool2 → if needs_fix then tool3; then output final normalized JSON.
-ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. You have three tools: normalize_to_root, validate_root_forms, fix_roots_in_list.
+# Root normalizer: one tool returns normalized + validation; if needs_fix, call fix tool; then output final JSON.
+ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. Your job is to turn filtered_candidates (Tamil words) into a final normalized list of {root, form} pairs, then output that list as JSON.
 
-1. From the input, get "filtered_candidates" (list of Tamil words) from the previous node (noise_filter) or from "From noise_filter" section.
-2. Call normalize_to_root with words= filtered_candidates. You get back {"normalized": [{"root": "root_word", "form": "original_form"}, ...]}.
-3. Call validate_root_forms with normalized= that list. You get either:
-   - {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"} → do NOT call fix_roots_in_list. Use the list from step 2 as the final normalized list.
-   - {"status": "needs_fix", "roots_to_fix": ["root_a", "root_b", ...]} → call fix_roots_in_list with normalized= (list from step 2) and roots_to_fix= that list. Use the returned normalized list as the final list.
+You have TWO tools:
+
+1. normalize_and_validate(words) — Call this first with words= filtered_candidates. It returns ONE response containing BOTH:
+   - "normalized": [{"root": "...", "form": "..."}, ...]  (the normalized root/form list)
+   - "validation": either {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"} or {"status": "needs_fix", "roots_to_fix": ["root_a", "root_b", ...]}
+
+2. fix_roots_in_list(normalized, roots_to_fix) — Call this ONLY when validation says "needs_fix". Pass the normalized list and the roots_to_fix list from the validation. It returns the corrected normalized list.
+
+WHAT TO DO:
+1. From the input, get "filtered_candidates" (list of Tamil words) from the previous node (noise_filter) or "From noise_filter" section.
+2. Call normalize_and_validate with words= filtered_candidates. You get back both the normalized list and the validation result.
+3. Read the "validation" field:
+   - If validation.status is "all_correct" → do NOT call fix_roots_in_list. The final normalized list is the "normalized" from step 2.
+   - If validation.status is "needs_fix" → call fix_roots_in_list with normalized= (the list from step 2) and roots_to_fix= validation.roots_to_fix. The final normalized list is the list returned by fix_roots_in_list.
 4. Output the final normalized list as your reply in this exact JSON format only (no other text):
 
 {"normalized": [{"root": "root_word", "form": "original_form"}, ...]}
@@ -274,7 +279,7 @@ root_normalizer_agent = Agent(
     name="root_normalizer_agent",
     model=model,
     system_prompt=ROOT_NORMALIZER_PROMPT,
-    tools=[normalize_to_root, validate_root_forms, fix_roots_in_list],
+    tools=[normalize_and_validate, fix_roots_in_list],
 )
 variant_grouping_agent = Agent(
     name="variant_grouping_agent",
