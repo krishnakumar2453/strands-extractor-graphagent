@@ -1,5 +1,5 @@
 # Tamil vocabulary extraction pipeline — word_candidates.py + compound-word graph
-# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
+# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
 from strands.multiagent import GraphBuilder
 from strands import Agent, tool
 import json
@@ -161,6 +161,49 @@ def fix_roots_in_list(normalized: list[dict], roots_to_fix: list[str]) -> dict[s
     return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
 
 
+# --- Suffix stop list: tokens that must not become vocabulary roots (GSR on classifier) ---
+SUFFIX_STOP_LIST = frozenset({
+    "க்கு", "ஐ", "கள்", "களை", "போல்", "இருந்து", "ஆல்", "உடன்", "வரை", "மூலம்", "விட",
+    "பதற்கு", "ஆர்", "என்று", "இல்", "க்குச்", "ஆக", "ஆம்", "ஒடு", "ஓடு", "அது", "வாறு",
+    "ஆச்சு", "ப்பை",  # from pipeline output: ஆச்சு (verb suffix), ப்பை (partial; add full forms if needed)
+})
+
+
+def filter_suffixes_from_classifier_output(
+    classifier_output: list, suffix_list: list[str] | frozenset[str] | None = None
+) -> list[dict]:
+    """Remove suffix-only tokens from root_words in SPLIT items. Preserve every form.
+    If suffix_list is None, uses SUFFIX_STOP_LIST. Returns cleaned classifier output (same length)."""
+    stop = frozenset(suffix_list) if suffix_list is not None else SUFFIX_STOP_LIST
+    out: list[dict] = []
+    for item in classifier_output or []:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        form = item.get("form") or ""
+        decision = item.get("decision", "")
+        if decision == "KEEP":
+            out.append(dict(item))
+            continue
+        if decision == "SPLIT":
+            roots = item.get("root_words") or []
+            filtered = [r for r in roots if (r if isinstance(r, str) else str(r)).strip() not in stop]
+            if not filtered:
+                out.append({"form": form, "decision": "KEEP", "root_word": form})
+            else:
+                out.append({"form": form, "decision": "SPLIT", "root_words": filtered})
+            continue
+        out.append(dict(item))
+    return out
+
+
+@tool
+def filter_suffixes_from_classifier_output_tool(classifier_output: list) -> dict[str, Any]:
+    """Remove grammatical suffix tokens from root_words in SPLIT items. Uses SUFFIX_STOP_LIST. Returns cleaned classifier output (JSON array)."""
+    cleaned = filter_suffixes_from_classifier_output(classifier_output)
+    return {"status": "success", "content": [{"text": json.dumps(cleaned, ensure_ascii=False)}]}
+
+
 # --- Converter: classifier output → split_candidates (deterministic) ---
 def classifier_output_to_split_candidates(classifier_output: list) -> list[dict]:
     """Convert classifier output to flat list of {root, form}. KEEP → one pair; SPLIT → one pair per root in root_words."""
@@ -262,9 +305,16 @@ EXAMPLE:
 [{"form": "பாடசாலை", "decision": "KEEP", "root_word": "பாடசாலை"}, {"form": "இருப்பதைப்போல்", "decision": "SPLIT", "root_words": ["இருப்பது", "போல்"]}]
 """
 
-CONVERT_TO_SPLIT_CANDIDATES_PROMPT = """You are the Converter Agent. You have one tool: convert_classifier_to_split_candidates.
+# --- GSR on classifier (before convert): strip suffix-only tokens from root_words ---
+GRAMMATICAL_SUFFIX_REMOVAL_ON_CLASSIFIER_PROMPT = """You are the Grammatical Suffix Removal on Classifier Agent. You have one tool: filter_suffixes_from_classifier_output_tool.
 
 1. From the input, get the classifier output: a JSON array from the previous node (lexical_classifier). Each element has "form", "decision", and either "root_word" (KEEP) or "root_words" (SPLIT).
+2. Call filter_suffixes_from_classifier_output_tool with classifier_output= that array.
+3. Output the tool result as your reply: the cleaned JSON array (same structure; suffix-only tokens removed from root_words; SPLIT items with empty root_words become KEEP with root_word=form). Output ONLY that JSON array, no other text."""
+
+CONVERT_TO_SPLIT_CANDIDATES_PROMPT = """You are the Converter Agent. You have one tool: convert_classifier_to_split_candidates.
+
+1. From the input, get the classifier output: a JSON array from the previous node (grammatical_suffix_removal_on_classifier). Each element has "form", "decision", and either "root_word" (KEEP) or "root_words" (SPLIT).
 2. Call convert_classifier_to_split_candidates with classifier_output= that array.
 3. Output the tool result as your reply: the JSON object with key "split_candidates" (array of {"root", "form"}). Output ONLY that JSON, no other text."""
 
@@ -418,7 +468,7 @@ A JSON object where:
 
 """
 
-# --- Agents: noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
+# --- Agents: noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
@@ -430,6 +480,12 @@ lexical_classifier_agent = Agent(
     model=model,
     system_prompt=LEXICAL_CLASSIFIER_PROMPT,
     tools=[],
+)
+grammatical_suffix_removal_on_classifier_agent = Agent(
+    name="grammatical_suffix_removal_on_classifier_agent",
+    model=model,
+    system_prompt=GRAMMATICAL_SUFFIX_REMOVAL_ON_CLASSIFIER_PROMPT,
+    tools=[filter_suffixes_from_classifier_output_tool],
 )
 convert_to_split_candidates_agent = Agent(
     name="convert_to_split_candidates_agent",
@@ -465,13 +521,15 @@ variant_grouping_validation_agent = Agent(
 builder = GraphBuilder()
 builder.add_node(noise_filter_agent, "noise_filter")
 builder.add_node(lexical_classifier_agent, "lexical_classifier")
+builder.add_node(grammatical_suffix_removal_on_classifier_agent, "grammatical_suffix_removal_on_classifier")
 builder.add_node(convert_to_split_candidates_agent, "convert_to_split_candidates")
 builder.add_node(grammatical_suffix_removal_agent, "grammatical_suffix_removal")
 builder.add_node(dictionary_root_agent, "dictionary_root")
 builder.add_node(variant_grouping_agent, "variant_grouping")
 builder.add_node(variant_grouping_validation_agent, "variant_grouping_validation")
 builder.add_edge("noise_filter", "lexical_classifier")
-builder.add_edge("lexical_classifier", "convert_to_split_candidates")
+builder.add_edge("lexical_classifier", "grammatical_suffix_removal_on_classifier")
+builder.add_edge("grammatical_suffix_removal_on_classifier", "convert_to_split_candidates")
 builder.add_edge("convert_to_split_candidates", "grammatical_suffix_removal")
 builder.add_edge("grammatical_suffix_removal", "dictionary_root")
 builder.add_edge("dictionary_root", "variant_grouping")
@@ -482,6 +540,7 @@ graph = builder.build()
 NODE_ORDER = [
     "noise_filter",
     "lexical_classifier",
+    "grammatical_suffix_removal_on_classifier",
     "convert_to_split_candidates",
     "grammatical_suffix_removal",
     "dictionary_root",
@@ -605,7 +664,7 @@ if __name__ == "__main__":
     from word_candidates import ocr_text_to_word_candidates
 
     parser = argparse.ArgumentParser(
-        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
     )
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
