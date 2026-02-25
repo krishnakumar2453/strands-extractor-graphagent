@@ -162,11 +162,68 @@ def fix_roots_in_list(normalized: list[dict], roots_to_fix: list[str]) -> dict[s
 
 
 # --- Suffix stop list: tokens that must not become vocabulary roots (GSR on classifier) ---
-SUFFIX_STOP_LIST = frozenset({
-    "க்கு", "ஐ", "கள்", "களை", "போல்", "இருந்து", "ஆல்", "உடன்", "வரை", "மூலம்", "விட",
-    "பதற்கு", "ஆர்", "என்று", "இல்", "க்குச்", "ஆக", "ஆம்", "ஒடு", "ஓடு", "அது", "வாறு",
-    "ஆச்சு", "ப்பை",  # from pipeline output: ஆச்சு (verb suffix), ப்பை (partial; add full forms if needed)
-})
+# 1. Plural Markers (பன்மை விகுதிகள்)
+PLURALS = {
+    "கள்", "களை", "மார்கள்"
+}
+
+# 2. Case Markers (வேற்றுமை உருபுகள்)
+CASE_MARKERS = {
+    "ஐ",                     # 2nd Case (Object)
+    "ஆல்", "ஆன்",             # 3rd Case (Instrumental)
+    "க்கு", "கு", "உக்கு",    # 4th Case (Dative/To)
+    "இன்",                    # 5th Case (Ablative)
+    "ஆது",                    # 6th Case (Genitive/Possessive)
+    "இல்"                     # 7th Case (Locative/In)
+}
+
+# 3. Adverbial & Quotative Markers (வினையடை / மேற்கோள்)
+ADVERBIAL_MARKERS = {
+    "ஆக", "ஆய்",                  # Adverbial
+}
+
+# 4. Clitics & Emphasizers (இடைச்சொற்கள்)
+CLITICS = {
+    "ஏ",                      # Exactly (Emphasis)
+    "ஓ", "ஆ",                   # Doubt / Question
+    "ஆவது"                     # At least
+}
+
+# 5. Verbal Noun/Purpose Extensions (தொழிற்பெயர் / வினையெச்சம்)
+VERB_EXTENSIONS = {
+    "பதற்கு", "வதற்கு",              # For the purpose of
+    "ஆர்", "ஆர்கள்",                 # Honorific / Plural verb endings
+    "அனர்","வாறு"        # Epicene plural verb ending (e.g., வந்தனர்)
+}
+
+# 6. Sandhi Joiners & Empty Morphemes (புணர்ச்சி / சாரியை)
+SANDHI_VARIANTS = {
+    "ஐக்", "ஐச்", "ஐத்", "ஐப்",
+    "க்குச்", "க்குத்", "க்குப்", "க்க்",
+    "களைக்", "களைச்", "களைத்", "களைப்",
+    "ஆகக்", "ஆகச்", "ஆகத்", "ஆகப்",
+    "அத்",                      # Inflectional increment (e.g., மரத்தை -> அத் + ஐ)
+    "இத்"                       # Inflectional increment / joiner
+}
+
+# Combine them all into one frozen set for fast O(1) lookup
+MASTER_SUFFIX_STOP_LIST = frozenset(
+    PLURALS | CASE_MARKERS | ADVERBIAL_MARKERS
+    | CLITICS | VERB_EXTENSIONS | SANDHI_VARIANTS
+)
+
+SUFFIX_STOP_LIST = MASTER_SUFFIX_STOP_LIST
+
+# Leading sandhi consonants to strip from start of root words (e.g. "ப்பை" -> "பை")
+LEADING_SANDHI = frozenset({"க்", "ச்", "த்", "ப்"})
+
+
+def _strip_leading_sandhi(s: str) -> str:
+    """If s starts with a leading sandhi consonant (க், ச், த், ப்), remove it and return the rest. Otherwise return s unchanged."""
+    s = (s or "").strip()
+    if len(s) >= 2 and s[:2] in LEADING_SANDHI:
+        return s[2:].strip()
+    return s
 
 
 def filter_suffixes_from_classifier_output(
@@ -187,7 +244,9 @@ def filter_suffixes_from_classifier_output(
             continue
         if decision == "SPLIT":
             roots = item.get("root_words") or []
-            filtered = [r for r in roots if (r if isinstance(r, str) else str(r)).strip() not in stop]
+            # Strip leading sandhi (க், ச், த், ப்) from each root, then filter by suffix stop list
+            normalized = [_strip_leading_sandhi(r if isinstance(r, str) else str(r)) for r in roots]
+            filtered = [r for r in normalized if r and r not in stop]
             if not filtered:
                 out.append({"form": form, "decision": "KEEP", "root_word": form})
             else:
@@ -298,6 +357,8 @@ Common postpositions/suffixes that favour SPLIT when the rest is root+case: ப�
 OUTPUT: Return ONLY a JSON array (no wrapper key). One element per input word.
 - KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<single entry>"}
 - SPLIT: {"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>", ...]}
+
+ROOT_WORDS RULE: Each string in root_words must be a valid Tamil dictionary word (base form) or a known grammatical suffix. Do NOT include sandhi-only forms: undo sandhi so the root is the actual word (e.g. பை not ப்பை/ப்பை; இருப்பது not இருப்பதை). No fragment like "ப்பை"—only "பை".
 
 Use "root_word" (string) for KEEP; "root_words" (array) for SPLIT. No leading/trailing spaces. Length of output array MUST equal length of filtered_candidates.
 
