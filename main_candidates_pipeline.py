@@ -1,6 +1,5 @@
-# Tamil vocabulary extraction pipeline — word_candidates.py + 4-agent graph
-# Word candidates from word_candidates.py. Then: noise_filter → root_normalizer (3 tools) → variant_grouping → variant_grouping_validation.
-# Root normalizer: tool1 normalize_to_root → tool2 validate_root_forms → if needs_fix, tool3 fix_roots_in_list.
+# Tamil vocabulary extraction pipeline — word_candidates.py + compound-word graph
+# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
 from strands.multiagent import GraphBuilder
 from strands import Agent, tool
 import json
@@ -162,6 +161,35 @@ def fix_roots_in_list(normalized: list[dict], roots_to_fix: list[str]) -> dict[s
     return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
 
 
+# --- Converter: classifier output → split_candidates (deterministic) ---
+def classifier_output_to_split_candidates(classifier_output: list) -> list[dict]:
+    """Convert classifier output to flat list of {root, form}. KEEP → one pair; SPLIT → one pair per root in root_words."""
+    out: list[dict] = []
+    for item in classifier_output or []:
+        if not isinstance(item, dict):
+            continue
+        form = item.get("form") or ""
+        decision = item.get("decision", "")
+        if decision == "KEEP":
+            root = (item.get("root_word") or "").strip()
+            if form:
+                out.append({"root": root, "form": form})
+        elif decision == "SPLIT":
+            roots = item.get("root_words") or []
+            for r in roots:
+                root = (r if isinstance(r, str) else str(r)).strip()
+                if form:
+                    out.append({"root": root, "form": form})
+    return out
+
+
+@tool
+def convert_classifier_to_split_candidates(classifier_output: list) -> dict[str, Any]:
+    """Convert lexical classifier output to split_candidates: flat list of {root, form}. KEEP → one pair; SPLIT → one pair per root."""
+    split_candidates = classifier_output_to_split_candidates(classifier_output)
+    return {"status": "success", "content": [{"text": json.dumps({"split_candidates": split_candidates}, ensure_ascii=False)}]}
+
+
 class _GeminiModelNoEmptyTools(GeminiModel):
     """Omit tools key when no tools, so Gemini API does not reject the request."""
 
@@ -188,7 +216,7 @@ model = _GeminiModelNoEmptyTools(
     params={"temperature": 0},
 )
 
-# --- Prompts (same as main.py: noise_filter, root_normalizer, variant_grouping) ---
+# --- Prompts: noise_filter, lexical_classifier, converter, GSR, dictionary_root, variant_grouping ---
 NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to remove three kinds of entries from a list of Tamil word candidates. Do nothing else.
 
 Input: "candidates". Output: "filtered_candidates".
@@ -213,9 +241,131 @@ OUTPUT (this exact JSON only):
 }
 """
 
+# --- Lexical vs Agglutinative Classifier ---
+LEXICAL_CLASSIFIER_PROMPT = """You are the Lexical vs Agglutinative Classifier Agent. From the previous node (noise_filter) get "filtered_candidates" (list of Tamil words). For each word, decide KEEP (one entry) or SPLIT (multiple roots).
+
+RULES:
+- KEEP when the word is:
+  (a) A root word (e.g. கல், போ, மிட்டாய்), OR
+  (b) A lexical compound (noun-noun / closed compound) that denotes one concept (e.g. பாடசாலை, இணையதளம், குச்சிமிட்டாய்). Do NOT split these.
+- SPLIT when the word is an agglutinative phrase: root(s) + case/postposition/tense (e.g. இருப்பதைப்போல், செய்துகொண்டிருக்கிறேன்). Emit the logical roots (and optionally postpositions like போல்) in root_words in order.
+
+Common postpositions/suffixes that favour SPLIT when the rest is root+case: போல், விட, மூலம், வரை, உடன், ஐ, இல், க்கு, ஆல்.
+
+OUTPUT: Return ONLY a JSON array (no wrapper key). One element per input word.
+- KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<single entry>"}
+- SPLIT: {"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>", ...]}
+
+Use "root_word" (string) for KEEP; "root_words" (array) for SPLIT. No leading/trailing spaces. Length of output array MUST equal length of filtered_candidates.
+
+EXAMPLE:
+[{"form": "பாடசாலை", "decision": "KEEP", "root_word": "பாடசாலை"}, {"form": "இருப்பதைப்போல்", "decision": "SPLIT", "root_words": ["இருப்பது", "போல்"]}]
+"""
+
+CONVERT_TO_SPLIT_CANDIDATES_PROMPT = """You are the Converter Agent. You have one tool: convert_classifier_to_split_candidates.
+
+1. From the input, get the classifier output: a JSON array from the previous node (lexical_classifier). Each element has "form", "decision", and either "root_word" (KEEP) or "root_words" (SPLIT).
+2. Call convert_classifier_to_split_candidates with classifier_output= that array.
+3. Output the tool result as your reply: the JSON object with key "split_candidates" (array of {"root", "form"}). Output ONLY that JSON, no other text."""
+
+# --- Grammatical Suffix Removal (correct roots that are still inflected in split_candidates) ---
+GSR_VALIDATE_SYSTEM = """You validate a list of Tamil root/form pairs ("split_candidates"). For each pair, check if "root" is in correct dictionary base form (no grammatical suffix left on the root).
+
+The list is already split (KEEP = one root, SPLIT = multiple roots per form). Some roots may still carry case/suffix (e.g. இருப்பதை instead of இருப்பது).
+
+RULE: The root is correct if it is a dictionary base form. If a root still has a grammatical suffix (கள், ஐ, இல், க்கு, ஆல், உடன், etc.) and stripping it would leave a valid Tamil word, flag it.
+
+If ALL roots are correct, return: {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}
+If ANY need correction, return: {"status": "needs_fix", "roots_to_fix": ["root1", "root2", ...]}
+Return ONLY valid JSON."""
+
+GSR_FIX_SYSTEM = """You correct only the roots listed in roots_to_fix. For each pair in split_candidates whose "root" is in roots_to_fix, replace "root" with the correct dictionary base form (e.g. இருப்பதை → இருப்பது). Leave all other pairs unchanged. Do not strip when the remainder would not be a valid word (e.g. மகள் stays மகள்).
+
+CRITICAL: Same number of entries in output as input. Every "form" unchanged. Only "root" values may change.
+
+OUTPUT: {"split_candidates": [{"root": "...", "form": "..."}, ...]}
+Return ONLY valid JSON."""
 
 
-# Root normalizer: tool1 → tool2 → if needs_fix then tool3; then output final normalized JSON.
+@tool
+def validate_split_candidates_roots(split_candidates: list[dict]) -> dict[str, Any]:
+    """Validate whether each root in split_candidates is in dictionary base form. Returns all_correct or roots_to_fix."""
+    if not split_candidates:
+        return {"status": "success", "content": [{"text": json.dumps({"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}, ensure_ascii=False)}]}
+    user_content = "Validate these root/form pairs. Is each \"root\" in dictionary base form?\n" + json.dumps(
+        {"split_candidates": split_candidates}, ensure_ascii=False
+    )
+    out = _call_llm_json(GSR_VALIDATE_SYSTEM, user_content)
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        data = {"status": "needs_fix", "roots_to_fix": []}
+    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
+
+
+@tool
+def fix_split_candidates_roots(split_candidates: list[dict], roots_to_fix: list[str]) -> dict[str, Any]:
+    """Correct the specified roots in split_candidates to dictionary base form. Returns updated split_candidates."""
+    if not split_candidates or not roots_to_fix:
+        return {"status": "success", "content": [{"text": json.dumps({"split_candidates": split_candidates}, ensure_ascii=False)}]}
+    user_content = "Correct only these roots: " + json.dumps(roots_to_fix, ensure_ascii=False) + "\nFull list:\n" + json.dumps(
+        {"split_candidates": split_candidates}, ensure_ascii=False
+    )
+    out = _call_llm_json(GSR_FIX_SYSTEM, user_content)
+    try:
+        data = json.loads(out)
+        if "split_candidates" not in data:
+            data = {"split_candidates": split_candidates}
+    except json.JSONDecodeError:
+        data = {"split_candidates": split_candidates}
+    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
+
+
+GRAMMATICAL_SUFFIX_REMOVAL_PROMPT = """You are the Grammatical Suffix Removal Agent. You have two tools: validate_split_candidates_roots, fix_split_candidates_roots.
+
+1. From the input, get "split_candidates" (list of {"root", "form"}) from the previous node.
+2. Call validate_split_candidates_roots with split_candidates= that list.
+3. If the result is {"status": "all_correct"} then use the list as-is. If {"status": "needs_fix", "roots_to_fix": [...]} then call fix_split_candidates_roots with split_candidates and roots_to_fix. Use the returned split_candidates as the final list.
+4. Output the final list as your reply in this exact JSON only: {"split_candidates": [{"root": "...", "form": "..."}, ...]}
+
+CRITICAL: Same number of entries as input. Only "root" values may change; every "form" must be preserved."""
+
+# --- Dictionary Root (normalize each root to canonical dictionary form) ---
+NORMALIZE_ROOTS_IN_LIST_SYSTEM = """You normalize each "root" in the given list to its canonical Tamil dictionary base form. The list has pairs {"root", "form"}. Return the same list with only "root" values possibly changed to dictionary form; "form" stays unchanged.
+
+Strip grammatical suffixes only when the remainder is a valid Tamil word. Do not strip when the remainder would not be a word (e.g. மகள் → மகள்). Suffixes: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம், ஒடு, ஓடு, அது, வாறு; sandhi ச், ப், த் when suffix.
+
+CRITICAL: Same number of entries. Every "form" unchanged. Only "root" may change.
+
+OUTPUT: {"normalized": [{"root": "dictionary_root", "form": "original_form"}, ...]}
+Return ONLY valid JSON."""
+
+
+@tool
+def normalize_roots_in_list(split_candidates: list[dict]) -> dict[str, Any]:
+    """Normalize each root in split_candidates to canonical dictionary form. Returns normalized list (same keys as current root/form)."""
+    if not split_candidates:
+        return {"status": "success", "content": [{"text": json.dumps({"normalized": []}, ensure_ascii=False)}]}
+    user_content = "Normalize each \"root\" in this list to dictionary base form. Keep \"form\" unchanged.\n" + json.dumps(
+        {"split_candidates": split_candidates}, ensure_ascii=False
+    )
+    out = _call_llm_json(NORMALIZE_ROOTS_IN_LIST_SYSTEM, user_content)
+    try:
+        data = json.loads(out)
+        if "normalized" not in data:
+            data = {"normalized": split_candidates}
+    except json.JSONDecodeError:
+        data = {"normalized": split_candidates, "raw": out[:500]}
+    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
+
+
+DICTIONARY_ROOT_PROMPT = """You are the Dictionary Root Agent. You have one tool: normalize_roots_in_list.
+
+1. From the input, get "split_candidates" (list of {"root", "form"}) from the previous node (grammatical_suffix_removal).
+2. Call normalize_roots_in_list with split_candidates= that list.
+3. Output the tool result as your reply: the JSON object with key "normalized" (array of {"root", "form"}). Output ONLY that JSON, no other text. Downstream variant_grouping expects "normalized"."""
+
+# Root normalizer: tool1 → tool2 → if needs_fix then tool3; then output final normalized JSON. (Kept for reference; replaced by compound-word pipeline.)
 ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. You have three tools: normalize_to_root, validate_root_forms, fix_roots_in_list.
 
 1. From the input, get "filtered_candidates" (list of Tamil words) from the previous node (noise_filter) or from "From noise_filter" section.
@@ -230,7 +380,7 @@ ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer Agent. You have three to
 CRITICAL — NOT A SINGLE WORD MUST BE MISSED: Words are very very important. Every word from filtered_candidates MUST appear exactly once as "form" in your final output. The number of entries in "normalized" MUST equal the number of words in filtered_candidates. Do not drop, add, or merge any form. Only remove grammatical suffixes when the remaining part is a real dictionary word (e.g. மகள் → மகள், never ம).
 """
 
-VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. Group grammatical variants under ONE root and output the final vocabulary. Input: "normalized" list of { "root", "form" }. Output: one JSON object (no wrapper key). Keys = Tamil root words. Values = arrays of ALL original "form" strings that belong to that root.
+VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. From the previous node (dictionary_root) get the list under key "normalized" (array of { "root", "form" }). Group grammatical variants under ONE root and output the final vocabulary. Output: one JSON object (no wrapper key). Keys = Tamil root words. Values = arrays of ALL original "form" strings that belong to that root.
 
 CRITICAL — NO FORM MAY BE MISSING: Every "form" in the input normalized list MUST appear in exactly one root's array. The union of all value arrays must equal the set of all "form" strings from the input. Do not omit any original form.
 
@@ -268,18 +418,36 @@ A JSON object where:
 
 """
 
-# --- Agents (4): noise_filter → root_normalizer (with tool) → variant_grouping → variant_grouping_validation ---
+# --- Agents: noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
     system_prompt=NOISE_FILTER_PROMPT,
     tools=[],
 )
-root_normalizer_agent = Agent(
-    name="root_normalizer_agent",
+lexical_classifier_agent = Agent(
+    name="lexical_classifier_agent",
     model=model,
-    system_prompt=ROOT_NORMALIZER_PROMPT,
-    tools=[normalize_to_root, validate_root_forms, fix_roots_in_list],
+    system_prompt=LEXICAL_CLASSIFIER_PROMPT,
+    tools=[],
+)
+convert_to_split_candidates_agent = Agent(
+    name="convert_to_split_candidates_agent",
+    model=model,
+    system_prompt=CONVERT_TO_SPLIT_CANDIDATES_PROMPT,
+    tools=[convert_classifier_to_split_candidates],
+)
+grammatical_suffix_removal_agent = Agent(
+    name="grammatical_suffix_removal_agent",
+    model=model,
+    system_prompt=GRAMMATICAL_SUFFIX_REMOVAL_PROMPT,
+    tools=[validate_split_candidates_roots, fix_split_candidates_roots],
+)
+dictionary_root_agent = Agent(
+    name="dictionary_root_agent",
+    model=model,
+    system_prompt=DICTIONARY_ROOT_PROMPT,
+    tools=[normalize_roots_in_list],
 )
 variant_grouping_agent = Agent(
     name="variant_grouping_agent",
@@ -296,16 +464,30 @@ variant_grouping_validation_agent = Agent(
 
 builder = GraphBuilder()
 builder.add_node(noise_filter_agent, "noise_filter")
-builder.add_node(root_normalizer_agent, "root_normalizer")
+builder.add_node(lexical_classifier_agent, "lexical_classifier")
+builder.add_node(convert_to_split_candidates_agent, "convert_to_split_candidates")
+builder.add_node(grammatical_suffix_removal_agent, "grammatical_suffix_removal")
+builder.add_node(dictionary_root_agent, "dictionary_root")
 builder.add_node(variant_grouping_agent, "variant_grouping")
 builder.add_node(variant_grouping_validation_agent, "variant_grouping_validation")
-builder.add_edge("noise_filter", "root_normalizer")
-builder.add_edge("root_normalizer", "variant_grouping")
+builder.add_edge("noise_filter", "lexical_classifier")
+builder.add_edge("lexical_classifier", "convert_to_split_candidates")
+builder.add_edge("convert_to_split_candidates", "grammatical_suffix_removal")
+builder.add_edge("grammatical_suffix_removal", "dictionary_root")
+builder.add_edge("dictionary_root", "variant_grouping")
 builder.add_edge("variant_grouping", "variant_grouping_validation")
 builder.set_entry_point("noise_filter")
 graph = builder.build()
 
-NODE_ORDER = ["noise_filter", "root_normalizer", "variant_grouping", "variant_grouping_validation"]
+NODE_ORDER = [
+    "noise_filter",
+    "lexical_classifier",
+    "convert_to_split_candidates",
+    "grammatical_suffix_removal",
+    "dictionary_root",
+    "variant_grouping",
+    "variant_grouping_validation",
+]
 
 
 def _recover_missing_roots(before_vocab: dict, after_vocab: dict) -> list[tuple[str, list[str]]]:
@@ -339,7 +521,83 @@ def _get_agent_output(node_result):
     return ""
 
 
+def _format_node_full_output(node_result) -> str:
+    """Format full node output including all agent text, tool calls, and tool results for pipeline.txt."""
+    if node_result is None or node_result.result is None:
+        return "(no result)"
+    parts = []
+    # Handle single message or list of messages (multi-turn with tools)
+    result = node_result.result
+    messages = result.messages if hasattr(result, "messages") and result.messages else ([result.message] if result.message else [])
+    for i, msg in enumerate(messages or []):
+        if not msg:
+            continue
+        if i > 0:
+            parts.append("\n--- turn %d ---" % (i + 1))
+        content = msg.get("content", []) if isinstance(msg, dict) else []
+        if not content:
+            parts.append(json.dumps(msg, ensure_ascii=False, indent=2))
+            continue
+        for j, block in enumerate(content):
+            if not isinstance(block, dict):
+                parts.append("[block %d]: %s" % (j, repr(block)))
+                continue
+            # Text from agent
+            if "text" in block and block["text"]:
+                parts.append("[agent output]\n%s" % (block["text"].strip(),))
+            # Tool call (tool_use / function_call / name)
+            elif block.get("type") == "tool_use" or "tool_use" in block:
+                tu = block.get("tool_use", block)
+                name = tu.get("name", "?")
+                inp = tu.get("input", tu.get("arguments", {}))
+                if isinstance(inp, str):
+                    try:
+                        inp = json.loads(inp)
+                    except Exception:
+                        pass
+                parts.append("[tool call: %s]\n%s" % (name, json.dumps(inp, ensure_ascii=False, indent=2)))
+            elif "name" in block and block.get("type") in ("function_call", "tool_use"):
+                name = block.get("name", "?")
+                inp = block.get("input", block.get("arguments", {}))
+                if isinstance(inp, str):
+                    try:
+                        inp = json.loads(inp)
+                    except Exception:
+                        pass
+                parts.append("[tool call: %s]\n%s" % (name, json.dumps(inp, ensure_ascii=False, indent=2)))
+            # Tool result
+            elif block.get("type") == "tool_result" or "tool_result" in block:
+                tr = block.get("tool_result", block)
+                content_list = tr.get("content", [tr.get("output", tr.get("result", ""))])
+                if isinstance(content_list, str):
+                    content_list = [{"text": content_list}]
+                for c in content_list:
+                    if isinstance(c, dict) and "text" in c:
+                        parts.append("[tool result]\n%s" % (c["text"].strip() or "(empty)"))
+                    else:
+                        parts.append("[tool result]\n%s" % (json.dumps(tr, ensure_ascii=False, indent=2)))
+            elif "content" in block and block.get("type") != "text":
+                # Generic content block (e.g. tool result with content array)
+                c = block["content"]
+                if isinstance(c, list):
+                    for item in c:
+                        if isinstance(item, dict) and "text" in item and item["text"]:
+                            parts.append("[tool result]\n%s" % (item["text"].strip(),))
+                else:
+                    parts.append("[content]\n%s" % (json.dumps(block, ensure_ascii=False, indent=2)))
+            else:
+                # Unknown block: show as JSON
+                parts.append("[block %d]\n%s" % (j, json.dumps(block, ensure_ascii=False, indent=2)))
+    if not parts:
+        parts.append(json.dumps(getattr(result, "message", result.__dict__ if hasattr(result, "__dict__") else {}), ensure_ascii=False, indent=2))
+    return "\n".join(parts)
+
+
 if __name__ == "__main__":
+    # Run with: python main_candidates_pipeline.py --image path/to/image.png
+    #       or: python main_candidates_pipeline.py --pdf path/to/doc.pdf
+    # Output: pdf_output/<basename>_page_N_pipeline_output.txt (all agent + tool outputs per node)
+    #         pdf_output/<basename>_vocabulary.json (final vocabulary)
     import argparse
     import time
     from pathlib import Path as PathLib
@@ -347,7 +605,7 @@ if __name__ == "__main__":
     from word_candidates import ocr_text_to_word_candidates
 
     parser = argparse.ArgumentParser(
-        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → root_normalizer (tool) → variant_grouping → vocabulary JSON."
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
     )
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
@@ -383,6 +641,11 @@ if __name__ == "__main__":
     elif args.image:
         from ocr import tamil_ocr_from_image
 
+        if " " in args.image and not os.path.isfile(args.image):
+            print("Warning: Image path contains a space. If you did not quote it, the path may be wrong.", file=sys.stderr)
+            print('  Use quotes, e.g.: --image "test_images/test_image (2).png"', file=sys.stderr)
+        if not os.path.isfile(args.image):
+            print(f"Warning: Image file not found: {args.image}", file=sys.stderr)
         print("Getting OCR from image (non-agentic)...")
         pages_ocr = [tamil_ocr_from_image(args.image)]
     else:
@@ -391,16 +654,20 @@ if __name__ == "__main__":
     input_basename = PathLib(args.pdf).stem if args.pdf else PathLib(args.image).stem
     os.makedirs(args.output_dir, exist_ok=True)
 
-    header = "\n" + "=" * 60 + " PIPELINE OUTPUTS (word_candidates.py + 3 agents, root_normalizer with tool) " + "=" * 60
+    header = "\n" + "=" * 60 + " PIPELINE OUTPUTS (word_candidates.py + compound-word pipeline) " + "=" * 60
     page_vocabularies = []
     page_vocabularies_before_validation = []
     page_output_paths = []
     graph_failed = False
 
     for page_num, page_text in enumerate(pages_ocr, start=1):
-        print(f"Page {page_num}/{len(pages_ocr)}: word_candidates.py → 3-agent graph...")
+        print(f"Page {page_num}/{len(pages_ocr)}: word_candidates.py → compound-word pipeline...")
         # 1) Candidates from word_candidates.py (no agents)
         candidates = ocr_text_to_word_candidates(page_text, deduplicate=True)
+        if not candidates and (page_text or "").strip():
+            print("Warning: OCR returned text but word_candidates produced no candidates. Check word_candidates rules.", file=sys.stderr)
+        elif not candidates:
+            print("Warning: No word candidates (OCR may be empty or path wrong). Use --image \"path/with spaces.png\" if the path has spaces.", file=sys.stderr)
         initial_input = json.dumps({"candidates": candidates}, ensure_ascii=False)
 
         try:
@@ -411,6 +678,14 @@ if __name__ == "__main__":
             break
 
         pipeline_lines = [header]
+        # Section: raw OCR (for debugging empty candidates)
+        ocr_len = len(page_text or "")
+        pipeline_lines.append(f"\n--- OCR (page {page_num}, {ocr_len} chars) ---\n{(page_text or '(empty)')[:5000]}\n")
+        if ocr_len > 5000:
+            pipeline_lines.append(f"... (truncated; full OCR in {input_basename}_page{page_num}_ocr_raw.txt)\n")
+        ocr_raw_path = os.path.join(args.output_dir, f"{input_basename}_page{page_num}_ocr_raw.txt")
+        with open(ocr_raw_path, "w", encoding="utf-8") as f:
+            f.write(page_text or "")
         # Section: word_candidates (from word_candidates.py)
         word_candidates_block = f"\n--- word_candidates (word_candidates.py) ---\n{initial_input}\n"
         pipeline_lines.append(word_candidates_block)
@@ -433,7 +708,11 @@ if __name__ == "__main__":
                     variant_grouping_before_validation_text = text
                 if node_id == "variant_grouping_validation":
                     variant_grouping_json_text = text
-            block = f"\n--- {node_id} ---\n{text}\n"
+            # Summary: agent final output
+            block = f"\n--- {node_id} ---\n[agent output]\n{text}\n"
+            # Full output: all tool calls and tool results for this node
+            full_out = _format_node_full_output(node_result)
+            block += f"\n[full output - agent + tools]\n{full_out}\n"
             print(block)
             pipeline_lines.append(block)
 
