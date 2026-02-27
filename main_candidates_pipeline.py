@@ -1,5 +1,5 @@
 # Tamil vocabulary extraction pipeline — word_candidates.py + compound-word graph
-# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
+# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
 from strands.multiagent import GraphBuilder
 from strands import Agent, tool
 import json
@@ -34,54 +34,65 @@ def _call_llm_json(system: str, user_content: str) -> str:
 
 
 # --- Suffix stop list: tokens that must not become vocabulary roots (GSR on classifier) ---
-# 1. Plural Markers (பன்மை விகுதிகள்)
-PLURALS = {
-    "கள்", "களை", "மார்கள்"
-}
+PLURALS = {"கள்", "களை", "மார்கள்"}
 
-# 2. Case Markers (வேற்றுமை உருபுகள்)
 CASE_MARKERS = {
-    "ஐ",                     # 2nd Case (Object)
-    "ஆல்", "ஆன்",             # 3rd Case (Instrumental)
-    "க்கு", "கு", "உக்கு",    # 4th Case (Dative/To)
-    "இன்",                    # 5th Case (Ablative)
-    "ஆது",                    # 6th Case (Genitive/Possessive)
-    "இல்"                     # 7th Case (Locative/In)
+    "அ", "ஐ", "இ", "ந்த", "ஆல்", "ஆன்", "க்கு", "கு", "உக்கு", "இன்", "ஆது", "இல்",
+    # Participles and missing Genitive
+    "த்த", "ற்ற", "கின்ற", "க்க", "கிய", "கியத்", "அது"
 }
 
-# 3. Adverbial & Quotative Markers (வினையடை / மேற்கோள்)
 ADVERBIAL_MARKERS = {
-    "ஆக", "ஆய்",                  # Adverbial
+    "ஆகு", "ஆக", "ஆய்", "பது", "யது", "வது"
 }
 
-# 4. Clitics & Emphasizers (இடைச்சொற்கள்)
-CLITICS = {
-    "ஏ",                      # Exactly (Emphasis)
-    "ஓ", "ஆ",                   # Doubt / Question
-    "ஆவது"                     # At least
-}
+CLITICS = {"ஏ", "ஓ", "ஆ", "ஆவது"}
 
-# 5. Verbal Noun/Purpose Extensions (தொழிற்பெயர் / வினையெச்சம்)
 VERB_EXTENSIONS = {
-    "பதற்கு", "வதற்கு",              # For the purpose of
-    "ஆர்", "ஆர்கள்",                 # Honorific / Plural verb endings
-    "அனர்","வாறு"        # Epicene plural verb ending (e.g., வந்தனர்)
+    "பதற்கு", "வதற்கு", "ஆர்", "ஆர்கள்", "அனர்", "வாறு",
+    "ஆள்", "ஓம்", "ஈர்கள்",
+    # Present Tense Conjugations (கிறது / கின்றது family)
+    "கிறது", "கின்றது", "கிறான்", "கின்றான்", "கிறாள்", "கின்றாள்",
+    "கிறார்", "கின்றார்", "கிறார்கள்", "கின்றார்கள்", "கின்றனர்", "கின்றன"
 }
 
-# 6. Sandhi Joiners & Empty Morphemes (புணர்ச்சி / சாரியை)
 SANDHI_VARIANTS = {
-    "ஐக்", "ஐச்", "ஐத்", "ஐப்",
-    "க்குச்", "க்குத்", "க்குப்", "க்க்",
-    "களைக்", "களைச்", "களைத்", "களைப்",
-    "ஆகக்", "ஆகச்", "ஆகத்", "ஆகப்",
-    "அத்",                      # Inflectional increment (e.g., மரத்தை -> அத் + ஐ)
-    "இத்"                       # Inflectional increment / joiner
+    "ஐக்", "ஐச்", "ஐத்", "ஐப்", "க்குச்", "க்குத்", "க்குப்", "க்க்",
+    "களைக்", "களைச்", "களைத்", "களைப்", "ஆகக்", "ஆகச்", "ஆகத்", "ஆகப்",
+    "அத்", "இத்",
+    # Empty Morphemes (சாரியைகள்)
+    "அற்று", "இற்று", "அன்"
 }
 
-# Combine them all into one frozen set for fast O(1) lookup
+# The 'Ae' (long E) series in Tamil (Emphatic fusion)
+TAMIL_AE_SERIES = {
+    "கே", "ஙே", "சே", "ஞே", "டே", "ணே",
+    "தே", "நே", "பே", "யே", "ரே",
+    "லே", "வே", "ழே", "ளே", "றே", "னே"
+}
+
+# The 'Aa' (long A) series in Tamil (Interrogative fusion)
+TAMIL_AA_SERIES = {
+    "கா", "ஙா", "சா", "ஞா", "டா", "ணா",
+    "தா",  "யா", "ரா",
+    "லா", "வா", "ழா", "ளா", "றா", "னா"
+}
+
+# The 'Oo' (long O) series in Tamil (Doubt/Emphasis fusion)
+TAMIL_OO_SERIES = {
+    "கோ", "ஙோ", "சோ", "ஞோ", "டோ", "ணோ",
+    "தோ", "நோ", "போ", "மோ", "யோ", "ரோ",
+    "லோ", "வோ", "ழோ", "ளோ", "றோ", "னோ"
+}
+
+# --- SAFETY NET: Valid single-letter dictionary roots that must NEVER be stripped ---
+PROTECTED_ROOTS = {"கா", "தா", "கோ", "தே", "மே"}
+
+# Combine suffix stop lists into one frozen set for fast O(1) lookup
 MASTER_SUFFIX_STOP_LIST = frozenset(
     PLURALS | CASE_MARKERS | ADVERBIAL_MARKERS
     | CLITICS | VERB_EXTENSIONS | SANDHI_VARIANTS
+    | TAMIL_AE_SERIES | TAMIL_AA_SERIES | TAMIL_OO_SERIES
 )
 
 SUFFIX_STOP_LIST = MASTER_SUFFIX_STOP_LIST
@@ -118,7 +129,8 @@ def filter_suffixes_from_classifier_output(
             roots = item.get("root_words") or []
             # Strip leading sandhi (க், ச், த், ப்) from each root, then filter by suffix stop list
             normalized = [_strip_leading_sandhi(r if isinstance(r, str) else str(r)) for r in roots]
-            filtered = [r for r in normalized if r and r not in stop]
+            protected = PROTECTED_ROOTS if suffix_list is None else frozenset()
+            filtered = [r for r in normalized if r and (r not in stop or r in protected)]
             if not filtered:
                 out.append({"form": form, "decision": "KEEP", "root_word": form})
             else:
@@ -126,13 +138,6 @@ def filter_suffixes_from_classifier_output(
             continue
         out.append(dict(item))
     return out
-
-
-@tool
-def filter_suffixes_from_classifier_output_tool(classifier_output: list) -> dict[str, Any]:
-    """Remove grammatical suffix tokens from root_words in SPLIT items. Uses SUFFIX_STOP_LIST. Returns cleaned classifier output (JSON array)."""
-    cleaned = filter_suffixes_from_classifier_output(classifier_output)
-    return {"status": "success", "content": [{"text": json.dumps(cleaned, ensure_ascii=False)}]}
 
 
 # --- Converter: classifier output → split_candidates (deterministic) ---
@@ -179,8 +184,8 @@ class _GeminiModelNoEmptyTools(GeminiModel):
 
 model = _GeminiModelNoEmptyTools(
     client_args={"api_key": os.getenv("GEMINI_API_KEY")},
-    model_id="gemini-2.0-flash",
-    params={"temperature": 0},
+    model_id="gemini-2.5-flash",
+    params={"temperature": 0, "max_output_tokens": 65536},
 )
 
 # --- Prompts: noise_filter, lexical_classifier, converter, GSR, dictionary_root, variant_grouping ---
@@ -209,34 +214,45 @@ OUTPUT (this exact JSON only):
 """
 
 # --- Lexical vs Agglutinative Classifier ---
-LEXICAL_CLASSIFIER_PROMPT = """You are the Lexical vs Agglutinative Classifier Agent. From the previous node (noise_filter) get "filtered_candidates" (list of Tamil words). For each word, decide KEEP (one entry) or SPLIT (multiple roots).
+LEXICAL_CLASSIFIER_PROMPT = """
+You are an advanced Lexical and Morphological Classifier Agent for a Tamil Dictionary Pipeline.
+From the previous node, you will receive "filtered_candidates" (a list of Tamil words).
+For each word, decide KEEP (one entry) or SPLIT (extract base roots + grammatical suffixes).
 
 RULES:
 - KEEP when the word is:
-  (a) A root word (e.g. கல், போ, மிட்டாய்), OR
-  (b) A lexical compound (noun-noun / closed compound) that denotes one concept (e.g. பாடசாலை, இணையதளம், குச்சிமிட்டாய்). Do NOT split these.
-- SPLIT when the word is an agglutinative phrase: root(s) + case/postposition/tense (e.g. இருப்பதைப்போல், செய்துகொண்டிருக்கிறேன்). Emit the logical roots (and optionally postpositions like போல்) in root_words in order.
+  (a) A standard dictionary root word (e.g., சிறுவன், மிட்டாய்).
+  (b) A lexical compound (noun-noun / closed compound) representing a single concept (e.g., பாடசாலை, இணையதளம்). Do NOT split these.
+- SPLIT when the word is an agglutinative phrase, contains postpositions, or is an inflected noun/verb.
 
-Common postpositions/suffixes that favour SPLIT when the rest is root+case: போல், விட, மூலம், வரை, உடன், ஐ, இல், க்கு, ஆல்.
+SPLIT EXTRACTION RULES (பகுபத உறுப்பிலக்கணம் for Dictionary Apps):
+Mentally perform standard Tamil morphological parsing to break the word into: பகுதி, சந்தி, இடைநிலை, சாரியை, விகுதி. 
 
-OUTPUT: Return ONLY a JSON array (no wrapper key). One element per input word.
-- KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<single entry>"}
-- SPLIT: {"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>", ...]}
+1. `root_words` (பகுதி & Postpositions): 
+   - Extract ONLY valid, standalone Tamil dictionary base words.
+   - STOP OVER-SPLITTING NOUNS/PRONOUNS: Do not break down base nouns or pronouns into etymological fragments. (e.g., Use "சிறுவன்", NOT "சிறு" + "அன்". Use "அவர்", NOT "அ" + "அர்").
+   - POSTPOSITIONS ARE ROOTS: Independent functional words attached to nouns (e.g., போல், போல, உடன், எல்லாம், பற்றி) MUST be extracted into the `root_words` array, NOT suffixes.
+   - COMPOUND VERBS: Extract all main and auxiliary roots (e.g., செய்துகொண்டிருந்தான் -> "செய்", "கொள்", "இரு"). Reverse all mutations/விகாரம்.
 
-ROOT_WORDS RULE: Each string in root_words must be a valid Tamil dictionary word (base form) or a known grammatical suffix. Do NOT include sandhi-only forms: undo sandhi so the root is the actual word (e.g. பை not ப்பை/ப்பை; இருப்பது not இருப்பதை). No fragment like "ப்பை"—only "பை".
+2. `suffixes` (இடைநிலை, சாரியை, விகுதி): 
+   - Extract ONLY meaningful grammatical markers indicating tense, plural, case, person, or emphasis (e.g., கள், ஐ, ஆல், கு, இன், அது, கண், இல், கின்று, கிறு, ஆன், ஆர், அர், ஓம், ஏ, உம், ஆக, ஆன).
+   - Do NOT leave this array empty if the original word was inflected.
 
-Use "root_word" (string) for KEEP; "root_words" (array) for SPLIT. No leading/trailing spaces. Length of output array MUST equal length of filtered_candidates.
+3. STRICT EXCLUSIONS (சந்தி & விகாரம்): 
+   - You MUST entirely discard linking consonants / Sandhi (க், ச், த், ப், வ், ய்). NEVER output them as suffixes. 
 
-EXAMPLE:
-[{"form": "பாடசாலை", "decision": "KEEP", "root_word": "பாடசாலை"}, {"form": "இருப்பதைப்போல்", "decision": "SPLIT", "root_words": ["இருப்பது", "போல்"]}]
+4. CONSERVATION OF MEANING:
+   - root_words + suffixes MUST contain the full conceptual meaning of the original word. Do not drop letters or meanings.
+
+OUTPUT FORMAT: Return ONLY a JSON array.
+
+EXAMPLES:
+[
+ {"form": "இணையதளம்", "decision": "KEEP", "root_word": "இணையதளம்"},
+ {"form": "தம்மைப்போலவே", "decision": "SPLIT", "root_words": ["தாம்", "போல்"], "suffixes": ["ஐ", "ஏ"]},
+ {"form": "செய்துகொண்டிருக்கின்றனர்", "decision": "SPLIT", "root_words": ["செய்", "கொள்", "இரு"], "suffixes": ["கின்று", "அன்", "அர்"]}
+]
 """
-
-# --- GSR on classifier (before convert): strip suffix-only tokens from root_words ---
-GRAMMATICAL_SUFFIX_REMOVAL_ON_CLASSIFIER_PROMPT = """You are the Grammatical Suffix Removal on Classifier Agent. You have one tool: filter_suffixes_from_classifier_output_tool.
-
-1. From the input, get the classifier output: a JSON array from the previous node (lexical_classifier). Each element has "form", "decision", and either "root_word" (KEEP) or "root_words" (SPLIT).
-2. Call filter_suffixes_from_classifier_output_tool with classifier_output= that array.
-3. Output the tool result as your reply: the cleaned JSON array (same structure; suffix-only tokens removed from root_words; SPLIT items with empty root_words become KEEP with root_word=form). Output ONLY that JSON array, no other text."""
 
 # --- Grammatical Suffix Removal (correct roots that are still inflected in split_candidates) ---
 GSR_VALIDATE_SYSTEM = """You validate a list of Tamil root/form pairs ("split_candidates"). For each pair, check if "root" is in correct dictionary base form (no grammatical suffix left on the root).
@@ -373,7 +389,7 @@ A JSON object where:
 
 """
 
-# --- Agents: noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → [convert in code] → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
+# --- Agents: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
@@ -385,12 +401,6 @@ lexical_classifier_agent = Agent(
     model=model,
     system_prompt=LEXICAL_CLASSIFIER_PROMPT,
     tools=[],
-)
-grammatical_suffix_removal_on_classifier_agent = Agent(
-    name="grammatical_suffix_removal_on_classifier_agent",
-    model=model,
-    system_prompt=GRAMMATICAL_SUFFIX_REMOVAL_ON_CLASSIFIER_PROMPT,
-    tools=[filter_suffixes_from_classifier_output_tool],
 )
 grammatical_suffix_removal_agent = Agent(
     name="grammatical_suffix_removal_agent",
@@ -417,13 +427,11 @@ variant_grouping_validation_agent = Agent(
     tools=[],
 )
 
-# Two-phase graph: convert step is deterministic in code (no agent) to avoid dropping KEEP items.
+# Two-phase graph: graph1 ends at lexical_classifier; bridge does suffix filter + convert in code.
 builder1 = GraphBuilder()
 builder1.add_node(noise_filter_agent, "noise_filter")
 builder1.add_node(lexical_classifier_agent, "lexical_classifier")
-builder1.add_node(grammatical_suffix_removal_on_classifier_agent, "grammatical_suffix_removal_on_classifier")
 builder1.add_edge("noise_filter", "lexical_classifier")
-builder1.add_edge("lexical_classifier", "grammatical_suffix_removal_on_classifier")
 builder1.set_entry_point("noise_filter")
 graph1 = builder1.build()
 
@@ -441,7 +449,7 @@ graph2 = builder2.build()
 NODE_ORDER = [
     "noise_filter",
     "lexical_classifier",
-    "grammatical_suffix_removal_on_classifier",
+    "suffix_filter_bridge",
     "convert_to_split_candidates",
     "grammatical_suffix_removal",
     "dictionary_root",
@@ -451,7 +459,7 @@ NODE_ORDER = [
 
 
 def _parse_classifier_output_from_gsr(text: str) -> list[dict] | None:
-    """Parse the GSR-on-classifier node output into a classifier array (list of {form, decision, root_word|root_words}). Returns None on failure."""
+    """Parse classifier output (from lexical_classifier or similar) into a classifier array (list of {form, decision, root_word|root_words}). Returns None on failure."""
     if not (text or "").strip():
         return None
     raw = text.strip()
@@ -499,6 +507,13 @@ def _recover_missing_roots(before_vocab: dict, after_vocab: dict) -> list[tuple[
             after_vocab[root] = list(dict.fromkeys(forms))
             added.append((root, forms))
     return added
+
+
+def _bridge_result(text: str):
+    """Build a minimal result-like object for bridge steps so _get_agent_output and _format_node_full_output work."""
+    msg = {"content": [{"text": text}]}
+    result = type("_R", (), {"message": msg, "messages": [msg]})()
+    return type("_NodeResult", (), {"result": result})()
 
 
 def _get_agent_output(node_result):
@@ -598,7 +613,7 @@ if __name__ == "__main__":
     from word_candidates import ocr_text_to_word_candidates
 
     parser = argparse.ArgumentParser(
-        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → grammatical_suffix_removal_on_classifier → convert_to_split_candidates → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
     )
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
@@ -670,15 +685,16 @@ if __name__ == "__main__":
             graph_failed = True
             break
 
-        # Deterministic convert: parse GSR-on-classifier output and convert to split_candidates (no LLM).
-        gsr_node_result = result1.results.get("grammatical_suffix_removal_on_classifier")
-        gsr_text = _get_agent_output(gsr_node_result)
-        classifier_output = _parse_classifier_output_from_gsr(gsr_text)
-        if classifier_output is None and gsr_text:
-            print("Warning: Could not parse grammatical_suffix_removal_on_classifier output as JSON; using empty list.", file=sys.stderr)
+        # Bridge: parse classifier output from lexical_classifier, filter suffix-only tokens in code, then convert to split_candidates.
+        classifier_node_result = result1.results.get("lexical_classifier")
+        classifier_text = _get_agent_output(classifier_node_result)
+        classifier_output = _parse_classifier_output_from_gsr(classifier_text)
+        if classifier_output is None and classifier_text:
+            print("Warning: Could not parse lexical_classifier output as JSON; using empty list.", file=sys.stderr)
         if classifier_output is None:
             classifier_output = []
-        split_candidates = classifier_output_to_split_candidates(classifier_output)
+        cleaned_classifier = filter_suffixes_from_classifier_output(classifier_output)
+        split_candidates = classifier_output_to_split_candidates(cleaned_classifier)
         convert_output = json.dumps({"split_candidates": split_candidates}, ensure_ascii=False)
 
         try:
@@ -688,10 +704,12 @@ if __name__ == "__main__":
             graph_failed = True
             break
 
-        # Merge results for pipeline output: graph1 nodes, synthetic convert, graph2 nodes.
+        # Merge results for pipeline output: graph1 nodes, synthetic suffix_filter_bridge, convert, graph2 nodes.
         merged_results = {}
-        for nid in ("noise_filter", "lexical_classifier", "grammatical_suffix_removal_on_classifier"):
+        for nid in ("noise_filter", "lexical_classifier"):
             merged_results[nid] = result1.results.get(nid)
+        # Synthetic result for bridge suffix filter (so pipeline output shows cleaned classifier)
+        merged_results["suffix_filter_bridge"] = _bridge_result(json.dumps(cleaned_classifier, ensure_ascii=False))
         merged_results["convert_to_split_candidates"] = None  # deterministic; no agent result
         for nid in ("grammatical_suffix_removal", "dictionary_root", "variant_grouping", "variant_grouping_validation"):
             merged_results[nid] = result2.results.get(nid)
@@ -717,6 +735,9 @@ if __name__ == "__main__":
             if node_id == "convert_to_split_candidates":
                 text = convert_output
                 full_out = "[deterministic]\n" + convert_output
+            elif node_id == "suffix_filter_bridge":
+                text = _get_agent_output(node_result)
+                full_out = "[bridge - suffix filter]\n" + (text or "")
             else:
                 text = _get_agent_output(node_result)
                 if text:
@@ -732,8 +753,9 @@ if __name__ == "__main__":
                     if node_id == "variant_grouping_validation":
                         variant_grouping_json_text = text
                 full_out = _format_node_full_output(node_result)
-            # Summary: agent final output (or deterministic output for convert)
-            block = f"\n--- {node_id} ---\n[agent output]\n{text}\n"
+            # Summary: agent output, or bridge/deterministic output
+            output_label = "bridge output" if node_id == "suffix_filter_bridge" else ("deterministic" if node_id == "convert_to_split_candidates" else "agent output")
+            block = f"\n--- {node_id} ---\n[{output_label}]\n{text}\n"
             block += f"\n[full output - agent + tools]\n{full_out}\n"
             print(block)
             pipeline_lines.append(block)

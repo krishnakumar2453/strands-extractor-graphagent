@@ -1,3 +1,156 @@
+v1 : 
+status : working good 
+issue : good for lexical compound words ,but miss some grammetical suffixes 
+
+check this : 
+
+
+prompt :
+
+# --- Lexical vs Agglutinative Classifier ---
+LEXICAL_CLASSIFIER_PROMPT = """
+You are the Lexical vs Agglutinative Classifier Agent. From the previous node (noise_filter) get "filtered_candidates" (list of Tamil words). For each word, decide KEEP (one entry) or SPLIT (multiple roots).
+
+RULES:
+- KEEP when the word is:
+  (a) A root word (e.g. கல், போ, மிட்டாய்), OR
+  (b) A lexical compound (noun-noun / closed compound) that denotes one concept (e.g. பாடசாலை, இணையதளம், குச்சிமிட்டாய்). Do NOT split these.
+- SPLIT when the word is an agglutinative phrase: root(s) + case/postposition/tense (e.g. இருப்பதைப்போல், செய்துகொண்டிருக்கிறேன்). Emit the logical roots (and optionally postpositions like போல்) in root_words in order.
+
+Common postpositions/suffixes that favour SPLIT when the rest is root+case: போல், விட, மூலம், வரை, உடன், ஐ, இல், க்கு, ஆல்.
+
+OUTPUT: Return ONLY a JSON array (no wrapper key). One element per input word.
+- KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<single entry>"}
+- SPLIT: {"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>", ...]}
+
+ROOT_WORDS RULE: Each string in root_words must be a valid Tamil dictionary word (base form) or a known grammatical suffix. Do NOT include sandhi-only forms: undo sandhi so the root is the actual word (e.g. பை not ப்பை/ப்பை; இருப்பது not இருப்பதை). No fragment like "ப்பை"—only "பை".
+
+Use "root_word" (string) for KEEP; "root_words" (array) for SPLIT. No leading/trailing spaces. Length of output array MUST equal length of filtered_candidates.
+
+EXAMPLE:
+[{"form": "பாடசாலை", "decision": "KEEP", "root_word": "பாடசாலை"}, {"form": "இருப்பதைப்போல்", "decision": "SPLIT", "root_words": ["இருப்பது", "போல்"]}]
+"""
+
+
+
+
+=======================================================================================================================================================
+
+
+v2 ) :
+
+status : testing 
+aim : solve v1 issues 
+
+------------
+
+LEXICAL_CLASSIFIER_PROMPT = """
+You are the Lexical vs Agglutinative Classifier Agent. From the previous node (noise_filter) get "filtered_candidates" (list of Tamil words). For each word, decide KEEP (one entry) or SPLIT (multiple roots).
+
+RULES:
+- KEEP when the word is:
+  (a) A root word (e.g. கல், போ, மிட்டாய்), OR
+  (b) A lexical compound (noun-noun / closed compound) that denotes one concept (e.g. பாடசாலை, இணையதளம், குச்சிமிட்டாய்). Do NOT split these.
+
+- SPLIT when the word is an agglutinative phrase: root(s) + case/postposition/tense (e.g. இருப்பதைப்போல், செய்துகொண்டிருக்கிறேன்). Any inflection that modifies number (plurals), case, role, tense, or acts as a preposition/adverb MUST trigger a SPLIT.
+  Emit ALL logical roots and suffixes in root_words in order.
+  
+  The sum of the root_words array MUST equal the total semantic and grammatical meaning of the original word. Do not discard markers (e.g. கள்). Isolate them.
+
+OUTPUT: Return ONLY a JSON array (no wrapper key). One element per input word.
+- KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<single entry>"}
+- SPLIT: {"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>", ...]}
+
+ROOT_WORDS RULE: Each string in root_words must be a valid Tamil dictionary word (absolute base form) or a known grammatical suffix. For nouns, always revert to the singular, uninflected nominative case (e.g., சிறுமி). For verbs, always revert to the simple imperative command form (e.g., செய்). Do NOT include sandhi-only forms: undo sandhi so the root is the actual word (e.g. பை not ப்பை/ப்பை; இருப்பது not இருப்பதை). No fragments.
+
+Use "root_word" (string) for KEEP; "root_words" (array) for SPLIT. No leading/trailing spaces. Length of output array MUST equal length of filtered_candidates.
+
+EXAMPLE:
+[
+ {"form": "பாடசாலை", "decision": "KEEP", "root_word": "பாடசாலை"},
+ {"form": "உதவிகளைச்", "decision": "SPLIT", "root_words": ["உதவி", "கள்", "ஐ"]},
+ {"form": "வீட்டிலிருந்து", "decision": "SPLIT", "root_words": ["வீடு", "இல்", "இருந்து"]},
+]
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+========================================================================================================================================================================
+
+
+
+
 # Compound Word Treatment Pipeline — All Prompts
 
 This file lists every prompt used in the approach: OCR, agents, and LLM calls inside tools.

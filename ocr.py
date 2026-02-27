@@ -1,20 +1,22 @@
 """
 Non-agentic Tamil OCR from images using Gemini.
 Extracts Tamil text exactly as it appears (no correction).
+Uses the Google Gen AI SDK (google.genai); see https://github.com/googleapis/python-genai
 """
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from PIL import Image
 
 load_dotenv()
 
-# Use google.generativeai for image-in, text-out (matches your old content_extracter)
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai.types import Part
     GENAI_AVAILABLE = True
 except ImportError:
+    genai = None
+    Part = None
     GENAI_AVAILABLE = False
 
 TAMIL_OCR_PROMPT = """Extract all Tamil text from this image exactly as it appears visually.
@@ -32,19 +34,19 @@ Strict Rules:
 Just output the raw Tamil text exactly as it appears on the page."""
 
 
-def _ensure_configured() -> None:
+def _get_client():
     if not GENAI_AVAILABLE:
-        raise RuntimeError("Install google-generativeai: pip install google-generativeai")
+        raise RuntimeError("Install the Google Gen AI SDK: pip install google-genai")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Set GEMINI_API_KEY in .env")
-    genai.configure(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 def tamil_ocr_from_image(image_path: str) -> str:
     """
     Extract Tamil text from an image file exactly as it appears.
-    Uses Gemini 2.0 Flash. Non-agentic.
+    Uses Gemini 2.0 Flash via the Google Gen AI SDK. Non-agentic.
 
     Args:
         image_path: Path to a PNG/JPEG image (e.g. a textbook page).
@@ -52,15 +54,24 @@ def tamil_ocr_from_image(image_path: str) -> str:
     Returns:
         Extracted Tamil text, or an error message string if something fails.
     """
-    _ensure_configured()
+    _get_client()  # raise if not configured
     image_path = Path(image_path)
     if not image_path.exists():
         return f"Error: File not found: {image_path}"
 
     try:
-        img = Image.open(image_path)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content([TAMIL_OCR_PROMPT, img])
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        suffix = image_path.suffix.lower()
+        mime_type = "image/png" if suffix == ".png" else "image/jpeg"
+        client = _get_client()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                TAMIL_OCR_PROMPT,
+                Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            ],
+        )
         if response and response.text:
             return response.text.strip()
         return "Error: No text extracted"
