@@ -1,7 +1,7 @@
 # Tamil vocabulary extraction pipeline — word_candidates.py + compound-word graph
-# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation.
+# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → variant_grouping_validation.
 from strands.multiagent import GraphBuilder
-from strands import Agent, tool
+from strands import Agent
 import json
 import os
 import sys
@@ -188,7 +188,7 @@ model = _GeminiModelNoEmptyTools(
     params={"temperature": 0, "max_output_tokens": 65536},
 )
 
-# --- Prompts: noise_filter, lexical_classifier, converter, GSR, dictionary_root, variant_grouping ---
+# --- Prompts: noise_filter, lexical_classifier, root_normalizer, variant_grouping ---
 NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to remove three kinds of entries from a list of Tamil word candidates. Do nothing else.
 
 Input: "candidates". Output: "filtered_candidates".
@@ -254,104 +254,18 @@ EXAMPLES:
 ]
 """
 
-# --- Grammatical Suffix Removal (correct roots that are still inflected in split_candidates) ---
-GSR_VALIDATE_SYSTEM = """You validate a list of Tamil root/form pairs ("split_candidates"). For each pair, check if "root" is in correct dictionary base form (no grammatical suffix left on the root).
+# --- Root normalizer: one agent that outputs canonical dictionary roots (no tools) ---
+ROOT_NORMALIZER_PROMPT = """You are the Root Normalizer. Your only job is to turn the input list of root/form pairs into the same list with every "root" in canonical Tamil dictionary base form.
 
-The list is already split (KEEP = one root, SPLIT = multiple roots per form). Some roots may still carry case/suffix (e.g. இருப்பதை instead of இருப்பது).
+Input: JSON with key "split_candidates" — an array of {"root", "form"}. Each "form" is the original surface string; each "root" may still carry inflection or case.
 
-RULE: The root is correct if it is a dictionary base form. If a root still has a grammatical suffix (கள், ஐ, இல், க்கு, ஆல், உடன், etc.) and stripping it would leave a valid Tamil word, flag it.
+Output: exactly one JSON object with key "normalized" — an array of {"root", "form"} with the same length and the same order. For each entry:
+- "form" is unchanged.
+- "root" is the dictionary base form: the canonical form you would look up in a Tamil dictionary. Remove any grammatical inflection or case ending from the root so it is a proper lemma. Do not change a root if the result of stripping would not be a valid Tamil word (e.g. leave மகள் as மகள்).
 
-If ALL roots are correct, return: {"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}
-If ANY need correction, return: {"status": "needs_fix", "roots_to_fix": ["root1", "root2", ...]}
-Return ONLY valid JSON."""
+Rules: same number of entries as input; every "form" preserved; only "root" may change. Reply with nothing but the JSON object (no markdown, no explanation)."""
 
-GSR_FIX_SYSTEM = """You correct only the roots listed in roots_to_fix. For each pair in split_candidates whose "root" is in roots_to_fix, replace "root" with the correct dictionary base form (e.g. இருப்பதை → இருப்பது). Leave all other pairs unchanged. Do not strip when the remainder would not be a valid word (e.g. மகள் stays மகள்).
-
-CRITICAL: Same number of entries in output as input. Every "form" unchanged. Only "root" values may change.
-
-OUTPUT: {"split_candidates": [{"root": "...", "form": "..."}, ...]}
-Return ONLY valid JSON."""
-
-
-@tool
-def validate_split_candidates_roots(split_candidates: list[dict]) -> dict[str, Any]:
-    """Validate whether each root in split_candidates is in dictionary base form. Returns all_correct or roots_to_fix."""
-    if not split_candidates:
-        return {"status": "success", "content": [{"text": json.dumps({"status": "all_correct", "message": "ALL ARE IN CORRECT FORM"}, ensure_ascii=False)}]}
-    user_content = "Validate these root/form pairs. Is each \"root\" in dictionary base form?\n" + json.dumps(
-        {"split_candidates": split_candidates}, ensure_ascii=False
-    )
-    out = _call_llm_json(GSR_VALIDATE_SYSTEM, user_content)
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        data = {"status": "needs_fix", "roots_to_fix": []}
-    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
-
-
-@tool
-def fix_split_candidates_roots(split_candidates: list[dict], roots_to_fix: list[str]) -> dict[str, Any]:
-    """Correct the specified roots in split_candidates to dictionary base form. Returns updated split_candidates."""
-    if not split_candidates or not roots_to_fix:
-        return {"status": "success", "content": [{"text": json.dumps({"split_candidates": split_candidates}, ensure_ascii=False)}]}
-    user_content = "Correct only these roots: " + json.dumps(roots_to_fix, ensure_ascii=False) + "\nFull list:\n" + json.dumps(
-        {"split_candidates": split_candidates}, ensure_ascii=False
-    )
-    out = _call_llm_json(GSR_FIX_SYSTEM, user_content)
-    try:
-        data = json.loads(out)
-        if "split_candidates" not in data:
-            data = {"split_candidates": split_candidates}
-    except json.JSONDecodeError:
-        data = {"split_candidates": split_candidates}
-    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
-
-
-GRAMMATICAL_SUFFIX_REMOVAL_PROMPT = """You are the Grammatical Suffix Removal Agent. You have two tools: validate_split_candidates_roots, fix_split_candidates_roots.
-
-1. From the input, get "split_candidates" (list of {"root", "form"}) from the previous node.
-2. Call validate_split_candidates_roots with split_candidates= that list.
-3. If the result is {"status": "all_correct"} then use the list as-is. If {"status": "needs_fix", "roots_to_fix": [...]} then call fix_split_candidates_roots with split_candidates and roots_to_fix. Use the returned split_candidates as the final list.
-4. Output the final list as your reply in this exact JSON only: {"split_candidates": [{"root": "...", "form": "..."}, ...]}
-
-CRITICAL: Same number of entries as input. Only "root" values may change; every "form" must be preserved."""
-
-# --- Dictionary Root (normalize each root to canonical dictionary form) ---
-NORMALIZE_ROOTS_IN_LIST_SYSTEM = """You normalize each "root" in the given list to its canonical Tamil dictionary base form. The list has pairs {"root", "form"}. Return the same list with only "root" values possibly changed to dictionary form; "form" stays unchanged.
-
-Strip grammatical suffixes only when the remainder is a valid Tamil word. Do not strip when the remainder would not be a word (e.g. மகள் → மகள்). Suffixes: கள், ஐ, இல், க்கு, ஆல், உடன், என்று, ஆக, ஆம், ஒடு, ஓடு, அது, வாறு; sandhi ச், ப், த் when suffix.
-
-CRITICAL: Same number of entries. Every "form" unchanged. Only "root" may change.
-
-OUTPUT: {"normalized": [{"root": "dictionary_root", "form": "original_form"}, ...]}
-Return ONLY valid JSON."""
-
-
-@tool
-def normalize_roots_in_list(split_candidates: list[dict]) -> dict[str, Any]:
-    """Normalize each root in split_candidates to canonical dictionary form. Returns normalized list (same keys as current root/form)."""
-    if not split_candidates:
-        return {"status": "success", "content": [{"text": json.dumps({"normalized": []}, ensure_ascii=False)}]}
-    user_content = "Normalize each \"root\" in this list to dictionary base form. Keep \"form\" unchanged.\n" + json.dumps(
-        {"split_candidates": split_candidates}, ensure_ascii=False
-    )
-    out = _call_llm_json(NORMALIZE_ROOTS_IN_LIST_SYSTEM, user_content)
-    try:
-        data = json.loads(out)
-        if "normalized" not in data:
-            data = {"normalized": split_candidates}
-    except json.JSONDecodeError:
-        data = {"normalized": split_candidates, "raw": out[:500]}
-    return {"status": "success", "content": [{"text": json.dumps(data, ensure_ascii=False)}]}
-
-
-DICTIONARY_ROOT_PROMPT = """You are the Dictionary Root Agent. You have one tool: normalize_roots_in_list.
-
-1. From the input, get "split_candidates" (list of {"root", "form"}) from the previous node (grammatical_suffix_removal).
-2. Call normalize_roots_in_list with split_candidates= that list.
-3. Output the tool result as your reply: the JSON object with key "normalized" (array of {"root", "form"}). Output ONLY that JSON, no other text. Downstream variant_grouping expects "normalized"."""
-
-VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. From the previous node (dictionary_root) get the list under key "normalized" (array of { "root", "form" }). Group grammatical variants under ONE root and output the final vocabulary. Output: one JSON object (no wrapper key). Keys = Tamil root words. Values = arrays of ALL original "form" strings that belong to that root.
+VARIANT_GROUPING_PROMPT = """You are the Variant Grouping Agent. From the previous node (root_normalizer) get the list under key "normalized" (array of { "root", "form" }). Group grammatical variants under ONE root and output the final vocabulary. Output: one JSON object (no wrapper key). Keys = Tamil root words. Values = arrays of ALL original "form" strings that belong to that root.
 
 CRITICAL — NO FORM MAY BE MISSING: Every "form" in the input normalized list MUST appear in exactly one root's array. The union of all value arrays must equal the set of all "form" strings from the input. Do not omit any original form.
 
@@ -389,7 +303,7 @@ A JSON object where:
 
 """
 
-# --- Agents: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → variant_grouping_validation ---
+# --- Agents: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → variant_grouping_validation ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
@@ -402,17 +316,11 @@ lexical_classifier_agent = Agent(
     system_prompt=LEXICAL_CLASSIFIER_PROMPT,
     tools=[],
 )
-grammatical_suffix_removal_agent = Agent(
-    name="grammatical_suffix_removal_agent",
+root_normalizer_agent = Agent(
+    name="root_normalizer_agent",
     model=model,
-    system_prompt=GRAMMATICAL_SUFFIX_REMOVAL_PROMPT,
-    tools=[validate_split_candidates_roots, fix_split_candidates_roots],
-)
-dictionary_root_agent = Agent(
-    name="dictionary_root_agent",
-    model=model,
-    system_prompt=DICTIONARY_ROOT_PROMPT,
-    tools=[normalize_roots_in_list],
+    system_prompt=ROOT_NORMALIZER_PROMPT,
+    tools=[],
 )
 variant_grouping_agent = Agent(
     name="variant_grouping_agent",
@@ -436,14 +344,12 @@ builder1.set_entry_point("noise_filter")
 graph1 = builder1.build()
 
 builder2 = GraphBuilder()
-builder2.add_node(grammatical_suffix_removal_agent, "grammatical_suffix_removal")
-builder2.add_node(dictionary_root_agent, "dictionary_root")
+builder2.add_node(root_normalizer_agent, "root_normalizer")
 builder2.add_node(variant_grouping_agent, "variant_grouping")
 builder2.add_node(variant_grouping_validation_agent, "variant_grouping_validation")
-builder2.add_edge("grammatical_suffix_removal", "dictionary_root")
-builder2.add_edge("dictionary_root", "variant_grouping")
+builder2.add_edge("root_normalizer", "variant_grouping")
 builder2.add_edge("variant_grouping", "variant_grouping_validation")
-builder2.set_entry_point("grammatical_suffix_removal")
+builder2.set_entry_point("root_normalizer")
 graph2 = builder2.build()
 
 NODE_ORDER = [
@@ -451,8 +357,7 @@ NODE_ORDER = [
     "lexical_classifier",
     "suffix_filter_bridge",
     "convert_to_split_candidates",
-    "grammatical_suffix_removal",
-    "dictionary_root",
+    "root_normalizer",
     "variant_grouping",
     "variant_grouping_validation",
 ]
@@ -613,7 +518,7 @@ if __name__ == "__main__":
     from word_candidates import ocr_text_to_word_candidates
 
     parser = argparse.ArgumentParser(
-        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → [bridge: suffix filter + convert] → grammatical_suffix_removal → dictionary_root → variant_grouping → vocabulary JSON."
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → vocabulary JSON."
     )
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
@@ -711,7 +616,7 @@ if __name__ == "__main__":
         # Synthetic result for bridge suffix filter (so pipeline output shows cleaned classifier)
         merged_results["suffix_filter_bridge"] = _bridge_result(json.dumps(cleaned_classifier, ensure_ascii=False))
         merged_results["convert_to_split_candidates"] = None  # deterministic; no agent result
-        for nid in ("grammatical_suffix_removal", "dictionary_root", "variant_grouping", "variant_grouping_validation"):
+        for nid in ("root_normalizer", "variant_grouping", "variant_grouping_validation"):
             merged_results[nid] = result2.results.get(nid)
 
         pipeline_lines = [header]
