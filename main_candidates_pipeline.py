@@ -1,5 +1,5 @@
 # Tamil vocabulary extraction pipeline — word_candidates.py + compound-word graph
-# Word candidates from word_candidates.py. Then: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → variant_grouping_validation.
+# Word candidates from word_candidates.py. Then: noise_filter → lexical_router → [bridge: morphological_extractor on SPLIT + suffix filter + convert] → root_normalizer → variant_grouping → variant_grouping_validation.
 from strands.multiagent import GraphBuilder
 from strands import Agent
 import json
@@ -13,9 +13,12 @@ from strands.models.gemini import GeminiModel
 
 load_dotenv()
 
+# Model for all pipeline agents (noise_filter, lexical_router, morphological_extractor, root_normalizer, variant_grouping, variant_grouping_validation). OCR uses its own model in ocr.py.
+AGENT_MODEL_ID = "gemini-2.5-pro"
+
 # --- LLM helper for tools ---
 def _call_llm_json(system: str, user_content: str) -> str:
-    """Call Gemini with system + user content; return raw response text."""
+    """Call Gemini with system + user content; return raw response text. Uses AGENT_MODEL_ID (Gemini Pro)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "{}"
@@ -26,7 +29,7 @@ def _call_llm_json(system: str, user_content: str) -> str:
         response_mime_type="application/json",
     )
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model=AGENT_MODEL_ID,
         contents=user_content,
         config=config,
     )
@@ -184,11 +187,11 @@ class _GeminiModelNoEmptyTools(GeminiModel):
 
 model = _GeminiModelNoEmptyTools(
     client_args={"api_key": os.getenv("GEMINI_API_KEY")},
-    model_id="gemini-2.5-flash",
+    model_id=AGENT_MODEL_ID,
     params={"temperature": 0, "max_output_tokens": 65536},
 )
 
-# --- Prompts: noise_filter, lexical_classifier, root_normalizer, variant_grouping ---
+# --- Prompts: noise_filter, lexical_router, morphological_extractor, root_normalizer, variant_grouping ---
 NOISE_FILTER_PROMPT = """You are the Noise Filter Agent. Your ONLY task is to remove three kinds of entries from a list of Tamil word candidates. Do nothing else.
 
 Input: "candidates". Output: "filtered_candidates".
@@ -213,44 +216,59 @@ OUTPUT (this exact JSON only):
 }
 """
 
-# --- Lexical vs Agglutinative Classifier ---
-LEXICAL_CLASSIFIER_PROMPT = """
-You are an advanced Lexical and Morphological Classifier Agent for a Tamil Dictionary Pipeline.
-From the previous node, you will receive "filtered_candidates" (a list of Tamil words).
-For each word, decide KEEP (one entry) or SPLIT (extract base roots + grammatical suffixes).
+
+
+
+# --- Agent 1: Lexical Router (KEEP vs SPLIT only) ---
+LEXICAL_ROUTER_PROMPT = """You are the Lexical Router Agent for a Tamil Dictionary Pipeline.
+From the input node, you will receive "filtered_candidates" (a list of Tamil words).
+Your ONLY job is to classify each word as either KEEP or SPLIT based on dictionary standards.
 
 RULES:
-- KEEP when the word is:
-  (a) A standard dictionary root word (e.g., சிறுவன், மிட்டாய்).
-  (b) A lexical compound (noun-noun / closed compound) representing a single concept (e.g., பாடசாலை, இணையதளம்). Do NOT split these.
-- SPLIT when the word is an agglutinative phrase, contains postpositions, or is an inflected noun/verb.
+- KEEP:
+  (a) Standard dictionary base words (e.g., சிறுவன், அவர்).
+  (b) Lexical compounds / closed nouns representing a single concept (e.g., பாடசாலை, இணையதளம், குச்சிமிட்டாய்).
+- SPLIT:
+  Agglutinative phrases, words with postpositions (போல், உடன், எல்லாம்), or inflected nouns/verbs that contain suffixes for tense, case, or plural markers.
 
-SPLIT EXTRACTION RULES (பகுபத உறுப்பிலக்கணம் for Dictionary Apps):
-Mentally perform standard Tamil morphological parsing to break the word into: பகுதி, சந்தி, இடைநிலை, சாரியை, விகுதி. 
-
-1. `root_words` (பகுதி & Postpositions): 
-   - Extract ONLY valid, standalone Tamil dictionary base words.
-   - STOP OVER-SPLITTING NOUNS/PRONOUNS: Do not break down base nouns or pronouns into etymological fragments. (e.g., Use "சிறுவன்", NOT "சிறு" + "அன்". Use "அவர்", NOT "அ" + "அர்").
-   - POSTPOSITIONS ARE ROOTS: Independent functional words attached to nouns (e.g., போல், போல, உடன், எல்லாம், பற்றி) MUST be extracted into the `root_words` array, NOT suffixes.
-   - COMPOUND VERBS: Extract all main and auxiliary roots (e.g., செய்துகொண்டிருந்தான் -> "செய்", "கொள்", "இரு"). Reverse all mutations/விகாரம்.
-
-2. `suffixes` (இடைநிலை, சாரியை, விகுதி): 
-   - Extract ONLY meaningful grammatical markers indicating tense, plural, case, person, or emphasis (e.g., கள், ஐ, ஆல், கு, இன், அது, கண், இல், கின்று, கிறு, ஆன், ஆர், அர், ஓம், ஏ, உம், ஆக, ஆன).
-   - Do NOT leave this array empty if the original word was inflected.
-
-3. STRICT EXCLUSIONS (சந்தி & விகாரம்): 
-   - You MUST entirely discard linking consonants / Sandhi (க், ச், த், ப், வ், ய்). NEVER output them as suffixes. 
-
-4. CONSERVATION OF MEANING:
-   - root_words + suffixes MUST contain the full conceptual meaning of the original word. Do not drop letters or meanings.
-
-OUTPUT FORMAT: Return ONLY a JSON array.
+OUTPUT FORMAT:
+Return ONLY a JSON array. Do not include markdown wrappers or explanations.
+- If KEEP: {"form": "<surface form>", "decision": "KEEP", "root_word": "<dictionary entry>"}
+- If SPLIT: {"form": "<surface form>", "decision": "SPLIT"}
 
 EXAMPLES:
 [
- {"form": "இணையதளம்", "decision": "KEEP", "root_word": "இணையதளம்"},
+ {"form": "இணையதளம்", "decision": "KEEP"},
+ {"form": "இணையதளம்", "decision": "KEEP"},
+ {"form": "அச்சிறுவனைப்", "decision": "SPLIT"},
+ {"form": "செய்துகொண்டிருக்கின்றனர்", "decision": "SPLIT"}
+]
+"""
+
+# --- Agent 2: Morphological Extractor (SPLIT words only: root_words + suffixes) ---
+MORPHOLOGICAL_EXTRACTOR_PROMPT = """You are the Tamil Morphological Parser Agent (பகுபத உறுப்பிலக்கணம்).
+You will receive a list of Tamil words classified as "SPLIT" (input: JSON with key "split_forms").
+Your ONLY job is to accurately extract the base roots (பகுதி) and meaningful grammatical suffixes (இடைநிலை, சாரியை, விகுதி).
+
+EXTRACTION RULES:
+1. `root_words`: Extract ONLY valid, standalone dictionary base words.
+   - Do NOT over-split base nouns or pronouns (e.g., Use "சிறுவன்", NOT "சிறு" + "அன்". Use "அவர்", NOT "அ" + "அர்").
+   - Postpositions (e.g., போல், போல, உடன், எல்லாம், பற்றி) MUST be treated as independent roots in the `root_words` array.
+   - For compound verbs, extract all base verb roots and reverse mutations (e.g., "கொண்டிருந்தவர்" -> ["கொள்", "இரு"]).
+2. `suffixes`: Extract meaningful grammatical markers (e.g., கள், ஐ, ஆல், கு, இன், அது, கண், இல், கின்று, கிறு, ஆன், ஆர், அர், ஓம், ஏ, உம், ஆக, ஆன).
+   - Do NOT drop the final terminal suffix of a word.
+3. STRICT EXCLUSION (சந்தி/விகாரம்):
+   - Completely discard single-consonant phonetic links (க், ச், ட், த், ப், ற், ந், வ், ய்). NEVER place them in the suffixes array.
+
+OUTPUT FORMAT:
+Return ONLY a JSON array. Do not include markdown wrappers or explanations.
+{"form": "<surface form>", "decision": "SPLIT", "root_words": ["<root1>", "<root2>"], "suffixes": ["<suffix1>", "<suffix2>"]}
+
+EXAMPLES:
+[
  {"form": "தம்மைப்போலவே", "decision": "SPLIT", "root_words": ["தாம்", "போல்"], "suffixes": ["ஐ", "ஏ"]},
- {"form": "செய்துகொண்டிருக்கின்றனர்", "decision": "SPLIT", "root_words": ["செய்", "கொள்", "இரு"], "suffixes": ["கின்று", "அன்", "அர்"]}
+ {"form": "கொண்டிருந்தவர்", "decision": "SPLIT", "root_words": ["கொள்", "இரு"], "suffixes": ["அ", "அவர்"]},
+ {"form": "உதவிகளைச்", "decision": "SPLIT", "root_words": ["உதவி"], "suffixes": ["கள்", "ஐ"]}
 ]
 """
 
@@ -303,17 +321,23 @@ A JSON object where:
 
 """
 
-# --- Agents: noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → variant_grouping_validation ---
+# --- Agents: noise_filter → lexical_router → [bridge: morphological_extractor on SPLIT + suffix filter + convert] → root_normalizer → ... ---
 noise_filter_agent = Agent(
     name="noise_filter_agent",
     model=model,
     system_prompt=NOISE_FILTER_PROMPT,
     tools=[],
 )
-lexical_classifier_agent = Agent(
-    name="lexical_classifier_agent",
+lexical_router_agent = Agent(
+    name="lexical_router_agent",
     model=model,
-    system_prompt=LEXICAL_CLASSIFIER_PROMPT,
+    system_prompt=LEXICAL_ROUTER_PROMPT,
+    tools=[],
+)
+morphological_extractor_agent = Agent(
+    name="morphological_extractor_agent",
+    model=model,
+    system_prompt=MORPHOLOGICAL_EXTRACTOR_PROMPT,
     tools=[],
 )
 root_normalizer_agent = Agent(
@@ -335,11 +359,11 @@ variant_grouping_validation_agent = Agent(
     tools=[],
 )
 
-# Two-phase graph: graph1 ends at lexical_classifier; bridge does suffix filter + convert in code.
+# Two-phase graph: graph1 ends at lexical_router; bridge runs morphological_extractor on SPLIT items, then suffix filter + convert.
 builder1 = GraphBuilder()
 builder1.add_node(noise_filter_agent, "noise_filter")
-builder1.add_node(lexical_classifier_agent, "lexical_classifier")
-builder1.add_edge("noise_filter", "lexical_classifier")
+builder1.add_node(lexical_router_agent, "lexical_router")
+builder1.add_edge("noise_filter", "lexical_router")
 builder1.set_entry_point("noise_filter")
 graph1 = builder1.build()
 
@@ -354,13 +378,24 @@ graph2 = builder2.build()
 
 NODE_ORDER = [
     "noise_filter",
-    "lexical_classifier",
+    "lexical_router",
+    "morphological_extractor",
     "suffix_filter_bridge",
     "convert_to_split_candidates",
     "root_normalizer",
     "variant_grouping",
     "variant_grouping_validation",
 ]
+
+
+def _run_morphological_extractor(split_forms: list[str]) -> list[dict]:
+    """Call the Morphological Extractor agent with only SPLIT forms. Returns list of {form, decision, root_words, suffixes}."""
+    if not split_forms:
+        return []
+    user_content = json.dumps({"split_forms": split_forms}, ensure_ascii=False)
+    raw = _call_llm_json(MORPHOLOGICAL_EXTRACTOR_PROMPT, user_content)
+    parsed = _parse_classifier_output_from_gsr(raw)
+    return list(parsed) if parsed else []
 
 
 def _parse_classifier_output_from_gsr(text: str) -> list[dict] | None:
@@ -518,7 +553,7 @@ if __name__ == "__main__":
     from word_candidates import ocr_text_to_word_candidates
 
     parser = argparse.ArgumentParser(
-        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_classifier → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → vocabulary JSON."
+        description="Tamil vocabulary: OCR → word_candidates.py → noise_filter → lexical_router → morphological_extractor (SPLIT only) → [bridge: suffix filter + convert] → root_normalizer → variant_grouping → vocabulary JSON."
     )
     parser.add_argument("--pdf", metavar="PATH", help="Get OCR from PDF (page by page)")
     parser.add_argument("--image", metavar="PATH", help="Get OCR from a single image")
@@ -590,17 +625,37 @@ if __name__ == "__main__":
             graph_failed = True
             break
 
-        # Bridge: parse classifier output from lexical_classifier, filter suffix-only tokens in code, then convert to split_candidates.
-        classifier_node_result = result1.results.get("lexical_classifier")
-        classifier_text = _get_agent_output(classifier_node_result)
-        classifier_output = _parse_classifier_output_from_gsr(classifier_text)
-        if classifier_output is None and classifier_text:
-            print("Warning: Could not parse lexical_classifier output as JSON; using empty list.", file=sys.stderr)
-        if classifier_output is None:
-            classifier_output = []
-        cleaned_classifier = filter_suffixes_from_classifier_output(classifier_output)
+        # Bridge: parse lexical_router output → run morphological_extractor on SPLIT items only → merge → suffix filter → convert to split_candidates.
+        router_node_result = result1.results.get("lexical_router")
+        router_text = _get_agent_output(router_node_result)
+        router_output = _parse_classifier_output_from_gsr(router_text)
+        if router_output is None and router_text:
+            print("Warning: Could not parse lexical_router output as JSON; using empty list.", file=sys.stderr)
+        if router_output is None:
+            router_output = []
+        # Partition KEEP vs SPLIT; run morphological extractor only on SPLIT forms.
+        split_forms = [item["form"] for item in router_output if isinstance(item, dict) and item.get("decision") == "SPLIT"]
+        extractor_output = _run_morphological_extractor(split_forms) if split_forms else []
+        extractor_by_form = {item.get("form"): item for item in extractor_output if isinstance(item, dict) and item.get("form")}
+        # Merge: preserve router order; use extractor result for SPLIT items.
+        full_classifier_output = []
+        for item in router_output:
+            if not isinstance(item, dict):
+                full_classifier_output.append(item)
+                continue
+            if item.get("decision") == "KEEP":
+                full_classifier_output.append(dict(item))
+            else:
+                enriched = extractor_by_form.get(item.get("form"))
+                if enriched:
+                    full_classifier_output.append(enriched)
+                else:
+                    # Fallback: extractor missed this form; keep as SPLIT with form as single root so it is not dropped
+                    full_classifier_output.append({"form": item.get("form", ""), "decision": "SPLIT", "root_words": [item.get("form", "")], "suffixes": []})
+        cleaned_classifier = filter_suffixes_from_classifier_output(full_classifier_output)
         split_candidates = classifier_output_to_split_candidates(cleaned_classifier)
         convert_output = json.dumps({"split_candidates": split_candidates}, ensure_ascii=False)
+        morphological_extractor_bridge_output = json.dumps(extractor_output, ensure_ascii=False)
 
         try:
             result2 = graph2(convert_output)
@@ -609,11 +664,11 @@ if __name__ == "__main__":
             graph_failed = True
             break
 
-        # Merge results for pipeline output: graph1 nodes, synthetic suffix_filter_bridge, convert, graph2 nodes.
+        # Merge results for pipeline output: graph1 nodes, morphological_extractor bridge, suffix_filter_bridge, convert, graph2 nodes.
         merged_results = {}
-        for nid in ("noise_filter", "lexical_classifier"):
+        for nid in ("noise_filter", "lexical_router"):
             merged_results[nid] = result1.results.get(nid)
-        # Synthetic result for bridge suffix filter (so pipeline output shows cleaned classifier)
+        merged_results["morphological_extractor"] = _bridge_result(morphological_extractor_bridge_output)
         merged_results["suffix_filter_bridge"] = _bridge_result(json.dumps(cleaned_classifier, ensure_ascii=False))
         merged_results["convert_to_split_candidates"] = None  # deterministic; no agent result
         for nid in ("root_normalizer", "variant_grouping", "variant_grouping_validation"):
@@ -659,7 +714,12 @@ if __name__ == "__main__":
                         variant_grouping_json_text = text
                 full_out = _format_node_full_output(node_result)
             # Summary: agent output, or bridge/deterministic output
-            output_label = "bridge output" if node_id == "suffix_filter_bridge" else ("deterministic" if node_id == "convert_to_split_candidates" else "agent output")
+            output_label = (
+                "bridge - suffix filter" if node_id == "suffix_filter_bridge"
+                else "bridge - morphological extractor" if node_id == "morphological_extractor"
+                else "deterministic" if node_id == "convert_to_split_candidates"
+                else "agent output"
+            )
             block = f"\n--- {node_id} ---\n[{output_label}]\n{text}\n"
             block += f"\n[full output - agent + tools]\n{full_out}\n"
             print(block)
